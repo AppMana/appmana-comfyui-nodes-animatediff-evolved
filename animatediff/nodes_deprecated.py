@@ -1,3 +1,4 @@
+import importlib.resources
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import torch
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
-import folder_paths
+from comfy.cmd import folder_paths
 from comfy.model_patcher import ModelPatcher
 
 from .ad_settings import AnimateDiffSettings, AdjustGroup, AdjustPE, AdjustWeight
@@ -148,7 +149,8 @@ class AnimateDiffCombine_Deprecated:
         ffmpeg_path = shutil.which("ffmpeg")
         #Hide ffmpeg formats if ffmpeg isn't available
         if ffmpeg_path is not None:
-            ffmpeg_formats = ["video/"+x[:-5] for x in folder_paths.get_filename_list(Folders.VIDEO_FORMATS)]
+            ffmpeg_format_names = [t.name for t in importlib.resources.files(f"{__package__}.video_formats").iterdir() if t.name.endswith(".json")]
+            ffmpeg_formats = ["video/"+x[:-5] for x in ffmpeg_format_names]
         else:
             ffmpeg_formats = []
             if not s.ffmpeg_warning_already_shown:
@@ -253,7 +255,7 @@ class AnimateDiffCombine_Deprecated:
                 #Should never be reachable
                 raise ProcessLookupError("Could not find ffmpeg")
 
-            video_format_path = folder_paths.get_full_path("video_formats", format_ext + ".json")
+            video_format_path = next(str(t) for t in importlib.resources.files(f"{__package__}.video_formats").iterdir() if t.name.startswith(format_ext))
             with open(video_format_path, 'r') as stream:
                 video_format = json.load(stream)
             file = f"{filename}_{counter:05}_.{video_format['extension']}"

@@ -2,7 +2,7 @@
 name = "comfyui-animatediff-evolved"
 description = "Improved AnimateDiff integration for ComfyUI."
 version = "1.0.11"
-license = "LICENSE"
+license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
@@ -13,3 +13,15 @@ Repository = "https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved"
 PublisherId = "kosinkadink"
 DisplayName = "ComfyUI-AnimateDiff-Evolved"
 Icon = ""
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["comfyui_animatediff_evolved"]
+package-dir = { "comfyui_animatediff_evolved" = "." }
+
+[project.entry-points."comfyui.custom_nodes"]
+comfyui_animatediff_evolved = "comfyui_animatediff_evolved.animatediff.nodes"
+comfyui_impact_pack_web_directory = "comfyui_animatediff_evolved"

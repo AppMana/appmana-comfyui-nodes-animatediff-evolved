@@ -1,9 +1,10 @@
 import uuid
-import folder_paths
+from comfy.cmd import folder_paths
 from typing import Union
 from torch import Tensor
 from collections.abc import Iterable
 
+from comfy.model_downloader import get_filename_list_with_downloadable, KNOWN_LORAS, get_or_download, KNOWN_CHECKPOINTS
 from comfy.model_patcher import ModelPatcher
 from comfy.sd import CLIP
 import comfy.sd
@@ -432,7 +433,7 @@ class MaskableLoraLoader:
             "required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
-                "lora_name": (folder_paths.get_filename_list("loras"), ),
+                "lora_name": (get_filename_list_with_downloadable("loras", KNOWN_LORAS), ),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             }
@@ -446,7 +447,7 @@ class MaskableLoraLoader:
         if strength_model == 0 and strength_clip == 0:
             return (model, clip)
         
-        lora_path = folder_paths.get_full_path("loras", lora_name)
+        lora_path = get_or_download("loras", lora_name, KNOWN_LORAS)
         lora = None
         if self.loaded_lora is not None:
             if self.loaded_lora[0] == lora_path:
@@ -474,7 +475,7 @@ class MaskableLoraLoaderModelOnly(MaskableLoraLoader):
         return {
             "required": {
                 "model": ("MODEL",),
-                "lora_name": (folder_paths.get_filename_list("loras"), ),
+                "lora_name": (get_filename_list_with_downloadable("loras", KNOWN_LORAS), ),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             }
         }
@@ -496,7 +497,7 @@ class MaskableSDModelLoader:
             "required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
+                "ckpt_name": (get_filename_list_with_downloadable("checkpoints", KNOWN_CHECKPOINTS), ),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             }
@@ -507,7 +508,7 @@ class MaskableSDModelLoader:
     FUNCTION = "load_model_as_lora"
 
     def load_model_as_lora(self, model: ModelPatcher, clip: CLIP, ckpt_name: str, strength_model: float, strength_clip: float):
-        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        ckpt_path = get_or_download("checkpoints", ckpt_name, KNOWN_CHECKPOINTS)
         out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         model_loaded = out[0]
         clip_loaded = out[1]
@@ -528,7 +529,7 @@ class MaskableSDModelLoaderModelOnly(MaskableSDModelLoader):
         return {
             "required": {
                 "model": ("MODEL",),
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
+                "ckpt_name": (get_filename_list_with_downloadable("checkpoints", KNOWN_CHECKPOINTS), ),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}),
             }
         }

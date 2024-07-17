@@ -1,7 +1,6 @@
 from typing import Union
 import torch
 
-from nodes import VAEEncode
 import comfy.utils
 from comfy.sd import VAE
 
@@ -144,9 +143,4 @@ class UpscaleAndVaeEncode:
         image = comfy.utils.common_upscale(samples=image, width=w*8, height=h*8, upscale_method=scale_method, crop=crop)
         image = image.movedim(1,-1)
         # now that images are the expected size, VAEEncode them
-        try:  # account for old ComfyUI versions (TODO: remove this when other changes require ComfyUI update)
-            if not hasattr(vae, "vae_encode_crop_pixels"):
-                image = VAEEncode.vae_encode_crop_pixels(image)
-        except Exception:
-            pass
         return ({"samples": vae.encode(image[:,:,:,:3])},)

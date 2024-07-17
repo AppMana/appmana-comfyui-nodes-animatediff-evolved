@@ -3,11 +3,12 @@ from typing import Union
 import torch
 from torch import Tensor
 
-import folder_paths
-import nodes as comfy_nodes
+from comfy.cmd import folder_paths
+from comfy.model_downloader import get_or_download, get_filename_list_with_downloadable, KNOWN_CHECKPOINTS
 from comfy.model_patcher import ModelPatcher
 import comfy.model_patcher
 import comfy.samplers
+from comfy.nodes.common import MAX_RESOLUTION
 from comfy.sd import load_checkpoint_guess_config
 
 from .logger import logger
@@ -41,7 +42,7 @@ class CheckpointLoaderSimpleWithNoiseSelect:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
+                "ckpt_name": (get_filename_list_with_downloadable("checkpoints", KNOWN_CHECKPOINTS), ),
                 "beta_schedule": (BetaSchedules.ALIAS_LIST, {"default": BetaSchedules.USE_EXISTING}, )
             },
             "optional": {
@@ -55,7 +56,7 @@ class CheckpointLoaderSimpleWithNoiseSelect:
     CATEGORY = "Animate Diff 🎭🅐🅓/extras"
 
     def load_checkpoint(self, ckpt_name, beta_schedule, output_vae=True, output_clip=True, use_custom_scale_factor=False, scale_factor=0.18215):
-        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        ckpt_path = get_or_download("checkpoints", ckpt_name, KNOWN_CHECKPOINTS)
         out = load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
         # register chosen beta schedule on model - convert to beta_schedule name recognized by ComfyUI
         new_model_sampling = BetaSchedules.to_model_sampling(beta_schedule, out[0])
@@ -72,8 +73,8 @@ class EmptyLatentImageLarge:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "width": ("INT", {"default": 512, "min": 64, "max": comfy_nodes.MAX_RESOLUTION, "step": 8}),
-                              "height": ("INT", {"default": 512, "min": 64, "max": comfy_nodes.MAX_RESOLUTION, "step": 8}),
+        return {"required": { "width": ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8}),
+                              "height": ("INT", {"default": 512, "min": 64, "max": MAX_RESOLUTION, "step": 8}),
                               "batch_size": ("INT", {"default": 1, "min": 1, "max": 262144})}}
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "generate"

@@ -1,24 +1,21 @@
-import hashlib
-from pathlib import Path
-from typing import Callable, Union
-from collections.abc import Iterable
-from time import time
 import copy
+import hashlib
+from time import time
+from typing import Callable, Union
 
-from torch import Tensor
-import torch
 import numpy as np
+import torch
+from torch import Tensor
 
-import folder_paths
+import comfy.model_sampling
+import comfy_extras.nodes.nodes_model_advanced
 from comfy.model_base import SD21UNCLIP, SDXL, BaseModel, SDXLRefiner, SVD_img2vid, model_sampling, ModelType
+from comfy.model_downloader import add_known_models, get_or_download, get_filename_list_with_downloadable
+from comfy.model_downloader_types import HuggingFile
 from comfy.model_management import xformers_enabled
 from comfy.model_patcher import ModelPatcher
 from comfy.sd import VAE
 from comfy.utils import ProgressBar
-
-import comfy.model_sampling
-import comfy_extras.nodes_model_advanced
-
 from .logger import logger
 
 BIGMIN = -(2**53-1)
@@ -89,7 +86,7 @@ class ModelSamplingType:
     MAP = {
         EPS: ModelType.EPS,
         V_PREDICTION: ModelType.V_PREDICTION,
-        LCM: comfy_extras.nodes_model_advanced.LCM,
+        LCM: comfy_extras.nodes.nodes_model_advanced.LCM,
     }
 
     @classmethod
@@ -98,7 +95,7 @@ class ModelSamplingType:
 
 
 def factory_model_sampling_discrete_distilled(original_timesteps=50):
-    class ModelSamplingDiscreteDistilledEvolved(comfy_extras.nodes_model_advanced.ModelSamplingDiscreteDistilled):
+    class ModelSamplingDiscreteDistilledEvolved(comfy_extras.nodes.nodes_model_advanced.ModelSamplingDiscreteDistilled):
         def __init__(self, *args, **kwargs):
             self.original_timesteps = original_timesteps  # normal LCM has 50
             super().__init__(*args, **kwargs)
@@ -109,7 +106,7 @@ def factory_model_sampling_discrete_distilled(original_timesteps=50):
 def evolved_model_sampling(model_config: ModelSamplingConfig, model_type: ModelType, alias: str, original_timesteps: int=None):
     # if LCM, need to handle manually
     if BetaSchedules.is_lcm(alias) or original_timesteps is not None:
-        sampling_type = comfy_extras.nodes_model_advanced.LCM
+        sampling_type = comfy_extras.nodes.nodes_model_advanced.LCM
         if original_timesteps is not None:
             sampling_base = factory_model_sampling_discrete_distilled(original_timesteps=original_timesteps)
         elif alias == BetaSchedules.LCM_100:
@@ -117,7 +114,7 @@ def evolved_model_sampling(model_config: ModelSamplingConfig, model_type: ModelT
         elif alias == BetaSchedules.LCM_25:
             sampling_base = factory_model_sampling_discrete_distilled(original_timesteps=25)
         else:
-            sampling_base = comfy_extras.nodes_model_advanced.ModelSamplingDiscreteDistilled
+            sampling_base = comfy_extras.nodes.nodes_model_advanced.ModelSamplingDiscreteDistilled
         class ModelSamplingAdvancedEvolved(sampling_base, sampling_type):
             pass
         # NOTE: if I want to support zsnr, this is where I would add that code
@@ -153,7 +150,7 @@ class BetaSchedules:
 
     ALIAS_LIST = [AUTOSELECT, USE_EXISTING] + ALIAS_ACTIVE_LIST
 
-    
+
 
     ALIAS_MAP = {
         SQRT_LINEAR: "sqrt_linear",
@@ -177,7 +174,7 @@ class BetaSchedules:
     @classmethod
     def to_name(cls, alias: str):
         return cls.ALIAS_MAP[alias]
-    
+
     @classmethod
     def to_config(cls, alias: str) -> ModelSamplingConfig:
         linear_start = None
@@ -186,7 +183,7 @@ class BetaSchedules:
             # uses linear_end=0.020
             linear_end = 0.020
         return ModelSamplingConfig(cls.to_name(alias), linear_start=linear_start, linear_end=linear_end)
-    
+
     @classmethod
     def _to_model_sampling(cls, alias: str, model_type: ModelType, config_override: ModelSamplingConfig=None, original_timesteps: int=None):
         if alias == cls.USE_EXISTING:
@@ -227,13 +224,13 @@ class SigmaSchedule:
         #self.config = config
         self.model_type = model_type
         self.original_timesteps = getattr(self.model_sampling, "original_timesteps", None)
-    
+
     def is_lcm(self):
         return self.original_timesteps is not None
 
     def total_sigmas(self):
         return len(self.model_sampling.sigmas)
-    
+
     def clone(self) -> 'SigmaSchedule':
         new_model_sampling = copy.deepcopy(self.model_sampling)
         #new_config = copy.deepcopy(self.config)
@@ -244,14 +241,14 @@ class SigmaSchedule:
 
     @staticmethod
     def apply_zsnr(new_model_sampling: comfy.model_sampling.ModelSamplingDiscrete):
-        new_model_sampling.set_sigmas(comfy_extras.nodes_model_advanced.rescale_zero_terminal_snr_sigmas(new_model_sampling.sigmas))
+        new_model_sampling.set_sigmas(comfy_extras.nodes.nodes_model_advanced.rescale_zero_terminal_snr_sigmas(new_model_sampling.sigmas))
 
     # def get_lcmified(self, original_timesteps=50, zsnr=False) -> 'SigmaSchedule':
     #     new_model_sampling = evolved_model_sampling(model_config=self.config, model_type=self.model_type, alias=None, original_timesteps=original_timesteps)
     #     if zsnr:
-    #         new_model_sampling.set_sigmas(comfy_extras.nodes_model_advanced.rescale_zero_terminal_snr_sigmas(new_model_sampling.sigmas))
+    #         new_model_sampling.set_sigmas(comfy_extras.nodes.nodes_model_advanced.rescale_zero_terminal_snr_sigmas(new_model_sampling.sigmas))
     #     return SigmaSchedule(model_sampling=new_model_sampling, config=self.config, model_type=self.model_type, is_lcm=True)
-        
+
 
 class InterpolationMethod:
     LINEAR = "linear"
@@ -305,53 +302,20 @@ class Folders:
     VIDEO_FORMATS = "animatediff_video_formats"
 
 
-def add_extension_to_folder_path(folder_name: str, extensions: Union[str, list[str]]):
-    if folder_name in folder_paths.folder_names_and_paths:
-        if isinstance(extensions, str):
-            folder_paths.folder_names_and_paths[folder_name][1].add(extensions)
-        elif isinstance(extensions, Iterable):
-            for ext in extensions:
-                folder_paths.folder_names_and_paths[folder_name][1].add(ext) 
-
-
-def try_mkdir(full_path: str):
-    try:
-        Path(full_path).mkdir()
-    except Exception:
-        pass
-
-
-# register motion models folder(s)
-folder_paths.add_model_folder_path(Folders.ANIMATEDIFF_MODELS, str(Path(__file__).parent.parent / "models"))
-folder_paths.add_model_folder_path(Folders.ANIMATEDIFF_MODELS, str(Path(folder_paths.models_dir) / Folders.ANIMATEDIFF_MODELS))
-add_extension_to_folder_path(Folders.ANIMATEDIFF_MODELS, folder_paths.supported_pt_extensions)
-try_mkdir(str(Path(folder_paths.models_dir) / Folders.ANIMATEDIFF_MODELS))
-
-# register motion LoRA folder(s)
-folder_paths.add_model_folder_path(Folders.MOTION_LORA, str(Path(__file__).parent.parent / "motion_lora"))
-folder_paths.add_model_folder_path(Folders.MOTION_LORA, str(Path(folder_paths.models_dir) / Folders.MOTION_LORA))
-add_extension_to_folder_path(Folders.MOTION_LORA, folder_paths.supported_pt_extensions)
-try_mkdir(str(Path(folder_paths.models_dir) / Folders.MOTION_LORA))
-
-# register video_formats folder
-folder_paths.add_model_folder_path(Folders.VIDEO_FORMATS, str(Path(__file__).parent.parent / "video_formats"))
-add_extension_to_folder_path(Folders.VIDEO_FORMATS, ".json")
-
-
 def get_available_motion_models():
-    return folder_paths.get_filename_list(Folders.ANIMATEDIFF_MODELS)
+    return get_filename_list_with_downloadable(Folders.ANIMATEDIFF_MODELS, KNOWN_ANIMATEDIFF_MODELS)
 
 
 def get_motion_model_path(model_name: str):
-    return folder_paths.get_full_path(Folders.ANIMATEDIFF_MODELS, model_name)
+    return get_or_download(Folders.ANIMATEDIFF_MODELS, model_name, KNOWN_ANIMATEDIFF_MODELS)
 
 
 def get_available_motion_loras():
-    return folder_paths.get_filename_list(Folders.MOTION_LORA)
+    return get_filename_list_with_downloadable(Folders.MOTION_LORA, KNOWN_MOTION_LORA)
 
 
 def get_motion_lora_path(lora_name: str):
-    return folder_paths.get_full_path(Folders.MOTION_LORA, lora_name)
+    return get_filename_list_with_downloadable(Folders.MOTION_LORA, lora_name, KNOWN_MOTION_LORA)
 
 
 # modified from https://stackoverflow.com/questions/22058048/hashing-a-file-in-python
@@ -494,3 +458,33 @@ class Timer(object):
 #         for key, value in loaded_values.items():
 #             if key in ABS_CONFIG:
 #                 ABS_CONFIG[key] = value
+
+KNOWN_ANIMATEDIFF_MODELS = []
+KNOWN_MOTION_LORA = []
+
+add_known_models(Folders.ANIMATEDIFF_MODELS, KNOWN_ANIMATEDIFF_MODELS,
+                 HuggingFile("guoyww/animatediff", "mm_sd_v14.ckpt"),
+                 HuggingFile("guoyww/animatediff", "mm_sd_v15.ckpt"),
+                 HuggingFile("guoyww/animatediff", "mm_sd_v15_v2.ckpt"),
+                 HuggingFile("guoyww/animatediff", "mm_sdxl_v10_beta.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v3_sd15_mm.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v3_sd15_adapter.ckpt"),
+                 HuggingFile("manshoety/AD_Stabilized_Motion", "mm-Stabilized_high.pth"),
+                 HuggingFile("manshoety/AD_Stabilized_Motion", "mm-Stabilized_mid.pth"),
+                 HuggingFile("manshoety/beta_testing_models", "mm-p_0.5.pth"),
+                 HuggingFile("manshoety/beta_testing_models", "mm-p_0.75.pth"),
+                 HuggingFile("CiaraRowles/TemporalDiff", "temporaldiff-v1-animatediff.safetensors"),
+                 HuggingFile("wangfuyun/AnimateLCM", "AnimateLCM_sd15_t2v.ckpt"),
+                 HuggingFile("wangfuyun/AnimateLCM", "AnimateLCM_sd15_t2v_lora.safetensors"),
+                 )
+
+add_known_models(Folders.MOTION_LORA, KNOWN_MOTION_LORA,
+                 HuggingFile("guoyww/animatediff", "v2_lora_PanLeft.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_PanRight.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_RollingAnticlockwise.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_RollingClockwise.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_TiltDown.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_TiltUp.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_ZoomIn.ckpt"),
+                 HuggingFile("guoyww/animatediff", "v2_lora_ZoomOut.ckpt"),
+                 )

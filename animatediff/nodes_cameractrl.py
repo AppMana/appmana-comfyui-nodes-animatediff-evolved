@@ -3,7 +3,7 @@ import os
 import torch
 
 import math
-import folder_paths
+from comfy.cmd import folder_paths
 import copy
 import json
 import numpy as np

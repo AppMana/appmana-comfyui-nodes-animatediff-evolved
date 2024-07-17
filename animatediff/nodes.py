@@ -1,4 +1,5 @@
 import comfy.sample as comfy_sample
+from comfy.cmd import folder_paths
 
 from .sampling import motion_sample_factory
 
@@ -37,12 +38,16 @@ from .nodes_deprecated import (AnimateDiffLoader_Deprecated, AnimateDiffLoaderAd
                                AnimateDiffModelSettings, AnimateDiffModelSettingsSimple, AnimateDiffModelSettingsAdvanced, AnimateDiffModelSettingsAdvancedAttnStrengths)
 from .nodes_lora import AnimateDiffLoraLoader
 
-from .logger import logger
+from .logger import *
+from .utils_model import Folders
 
 # override comfy_sample.sample with animatediff-support version
 comfy_sample.sample = motion_sample_factory(comfy_sample.sample)
 comfy_sample.sample_custom = motion_sample_factory(comfy_sample.sample_custom, is_custom=True)
 
+folder_paths.add_model_folder_path(Folders.ANIMATEDIFF_MODELS, extensions=folder_paths.supported_pt_extensions)
+folder_paths.add_model_folder_path(Folders.MOTION_LORA, extensions=folder_paths.supported_pt_extensions)
+folder_paths.add_model_folder_path(Folders.VIDEO_FORMATS, extensions={".json"})
 
 NODE_CLASS_MAPPINGS = {
     # Unencapsulated
@@ -60,7 +65,7 @@ NODE_CLASS_MAPPINGS = {
     "ADE_LoopedUniformContextOptions": LoopedUniformContextOptionsNode,
     "ADE_ViewsOnlyContextOptions": ViewAsContextOptionsNode,
     "ADE_BatchedContextOptions": BatchedContextOptionsNode,
-    "ADE_AnimateDiffUniformContextOptions": LegacyLoopedUniformContextOptionsNode, # Legacy
+    "ADE_AnimateDiffUniformContextOptions": LegacyLoopedUniformContextOptionsNode,  # Legacy
     "ADE_VisualizeContextOptionsK": VisualizeContextOptionsK,
     "ADE_VisualizeContextOptionsKAdv": VisualizeContextOptionsKAdv,
     "ADE_VisualizeContextOptionsSCustom": VisualizeContextOptionsSCustom,
@@ -190,7 +195,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_LoopedUniformContextOptions": "Context Options◆Looped Uniform 🎭🅐🅓",
     "ADE_ViewsOnlyContextOptions": "Context Options◆Views Only [VRAM⇈] 🎭🅐🅓",
     "ADE_BatchedContextOptions": "Context Options◆Batched [Non-AD] 🎭🅐🅓",
-    "ADE_AnimateDiffUniformContextOptions": "Context Options◆Looped Uniform 🎭🅐🅓", # Legacy
+    "ADE_AnimateDiffUniformContextOptions": "Context Options◆Looped Uniform 🎭🅐🅓",  # Legacy
     "ADE_VisualizeContextOptionsK": "Visualize Context Options (K.) 🎭🅐🅓",
     "ADE_VisualizeContextOptionsKAdv": "Visualize Context Options (K.Adv.) 🎭🅐🅓",
     "ADE_VisualizeContextOptionsSCustom": "Visualize Context Options (S.Cus.) 🎭🅐🅓",
