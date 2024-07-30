@@ -13,6 +13,8 @@ from comfy.ldm.modules.diffusionmodules import openaimodel
 import comfy.model_management
 import comfy.samplers
 import comfy.sample
+from comfy.model_management import load_models_gpu
+
 SAMPLE_FALLBACK = False
 try:
     import comfy.sampler_helpers
@@ -483,7 +485,7 @@ def motion_sample_factory(orig_comfy_sample: Callable, is_custom: bool=False) ->
                 else:
                     if SAMPLE_FALLBACK:  # backwards compatibility, for now
                         # in older comfy, model needs to be loaded to get proper model_sampling to be used for sigmas
-                        comfy.model_management.load_model_gpu(model)
+                        load_models_gpu([model])
                         iter_model = model.model
                     else:
                         iter_model = model
