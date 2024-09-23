@@ -19,7 +19,7 @@ from comfy.sd import CLIP, VAE
 from .ad_settings import AnimateDiffSettings, AdjustPE, AdjustWeight
 from .adapter_cameractrl import CameraPoseEncoder, CameraEntry, prepare_pose_embedding
 from .context import ContextOptions, ContextOptions, ContextOptionsGroup
-from .motion_module_ad import (AnimateDiffModel, AnimateDiffFormat, EncoderOnlyAnimateDiffModel, VersatileAttention,
+from .motion_module_ad import (AnimateDiffModel, AnimateDiffFormat, EncoderOnlyAnimateDiffModel, VersatileAttention, PerBlock, AllPerBlocks,
                                has_mid_block, normalize_ad_state_dict, get_position_encoding_max_len)
 from .logger import logger
 from .utils_motion import (ADKeyframe, ADKeyframeGroup, MotionCompatibilityError, InputPIA,
@@ -36,7 +36,7 @@ from .sample_settings import SampleSettings, SeedNoiseGeneration
 class ModelPatcherAndInjector(ModelPatcher):
     def __init__(self, m: ModelPatcher):
         # replicate ModelPatcher.clone() to initialize ModelPatcherAndInjector
-        super().__init__(m.model, m.load_device, m.offload_device, m.size, m.current_device, weight_inplace_update=m.weight_inplace_update)
+        super().__init__(m.model, m.load_device, m.offload_device, m.size, weight_inplace_update=m.weight_inplace_update)
         self.patches = {}
         for k in m.patches:
             self.patches[k] = m.patches[k][:]
@@ -62,9 +62,16 @@ class ModelPatcherAndInjector(ModelPatcher):
         self.model_params_lowvram_keys = {} # keeps track of keys with applied 'weight_function' or 'bias_function'
         # injection stuff
         self.currently_injected = False
+        self.skip_injection = False
         self.motion_injection_params: InjectionParams = InjectionParams()
         self.sample_settings: SampleSettings = SampleSettings()
         self.motion_models: MotionModelGroup = None
+        # backwards-compatible calculate_weight
+        if hasattr(comfy.lora, "calculate_weight"):
+            self.do_calculate_weight = comfy.lora.calculate_weight
+        else:
+            self.do_calculate_weight = self.calculate_weight
+
     
     def clone(self, hooks_only=False):
         cloned = ModelPatcherAndInjector(self)
@@ -219,55 +226,86 @@ class ModelPatcherAndInjector(ModelPatcher):
                     combined_patches[key] = current_patches
         return combined_patches
 
-    def model_patches_to(self, device):
-        super().model_patches_to(device)
-
-    def patch_model(self, device_to=None, patch_weights=True):
+    def patch_model(self, *args, **kwargs):
+        was_injected = False
+        if self.currently_injected:
+            self.eject_model()
+            was_injected = True
         # first, perform model patching
-        if patch_weights: # TODO: keep only 'else' portion when don't need to worry about past comfy versions
-            patched_model = super().patch_model(device_to)
-        else:
-            patched_model = super().patch_model(device_to, patch_weights)
-        # finally, perform motion model injection
-        self.inject_model()
+        patched_model = super().patch_model(*args, **kwargs)
+        # bring injection back to original state
+        if was_injected and not self.currently_injected:
+            self.inject_model()
         return patched_model
 
-    def patch_model_lowvram(self, *args, **kwargs):
+    def load(self, device_to=None, lowvram_model_memory=0, *args, **kwargs):
+        self.eject_model()
         try:
-            return super().patch_model_lowvram(*args, **kwargs)
+            return super().load(device_to=device_to, lowvram_model_memory=lowvram_model_memory, *args, **kwargs)
         finally:
-            # check if any modules have weight_function or bias_function that is not None
-            # NOTE: this serves no purpose currently, but I have it here for future reasons
-            for n, m in self.model.named_modules():
-                if not hasattr(m, "comfy_cast_weights"):
-                    continue
-                if getattr(m, "weight_function", None) is not None:
-                    self.model_params_lowvram = True
-                    self.model_params_lowvram_keys[f"{n}.weight"] = n
-                if getattr(m, "bias_function", None) is not None:
-                    self.model_params_lowvram = True
-                    self.model_params_lowvram_keys[f"{n}.bias"] = n
+            self.inject_model()
+            if lowvram_model_memory > 0:
+                self._patch_lowvram_extras()
+
+    def _patch_lowvram_extras(self):
+        # check if any modules have weight_function or bias_function that is not None
+        # NOTE: this serves no purpose currently, but I have it here for future reasons
+        self.model_params_lowvram = False
+        self.model_params_lowvram_keys.clear()
+        for n, m in self.model.named_modules():
+            if not hasattr(m, "comfy_cast_weights"):
+                continue
+            if getattr(m, "weight_function", None) is not None:
+                self.model_params_lowvram = True
+                self.model_params_lowvram_keys[f"{n}.weight"] = n
+            if getattr(m, "bias_function", None) is not None:
+                self.model_params_lowvram = True
+                self.model_params_lowvram_keys[f"{n}.bias"] = n  
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         # first, eject motion model from unet
         self.eject_model()
         # finally, do normal model unpatching
-        if unpatch_weights: # TODO: keep only 'else' portion when don't need to worry about past comfy versions
+        if unpatch_weights:
             # handle hooked_patches first
             self.clean_hooks()
+        try:
+            return super().unpatch_model(device_to, unpatch_weights)
+        finally:
+            self.model_params_lowvram = False
+            self.model_params_lowvram_keys.clear()
+
+    def partially_load(self, *args, **kwargs):
+        # partially_load calls patch_model, but we don't want to inject model in the intermediate call;
+        # make sure to eject before performing partial load, then inject
+        was_injected = self.currently_injected
+        try:
+            self.eject_model()
             try:
-                return super().unpatch_model(device_to)
+                self.skip_injection = True
+                to_return = super().partially_load(*args, **kwargs)
+                self.skip_injection = False
+                self.inject_model()
+                return to_return
             finally:
-                self.model_params_lowvram = False
-                self.model_params_lowvram_keys.clear()
-        else:
-            try:
-                return super().unpatch_model(device_to, unpatch_weights)
-            finally:
-                self.model_params_lowvram = False
-                self.model_params_lowvram_keys.clear()
+                self.skip_injection = False
+        finally:
+            if was_injected and not self.currently_injected:
+                self.inject_model()
+
+    def partially_unload(self, *args, **kwargs):
+        if not self.currently_injected:
+            return super().partially_unload(*args, **kwargs)
+        # make sure to eject before performing partial unload, then inject again
+        self.eject_model()
+        try:
+           return super().partially_unload(*args, **kwargs)
+        finally:
+            self.inject_model()
 
     def inject_model(self):
+        if self.skip_injection: # make it possible to skip injection for intermediate calls (partial load)
+            return
         if self.motion_models is not None:
             for motion_model in self.motion_models.models:
                 self.currently_injected = True
@@ -347,7 +385,7 @@ class ModelPatcherAndInjector(ModelPatcher):
 
         # TODO: handle model_params_lowvram stuff if necessary
         temp_weight = comfy.model_management.cast_to_device(weight, weight.device, torch.float32, copy=True)
-        out_weight = self.calculate_weight(combined_patches[key], temp_weight, key).to(weight.dtype)
+        out_weight = self.do_calculate_weight(combined_patches[key], temp_weight, key).to(weight.dtype)
         if self.lora_hook_mode == LoraHookMode.MAX_SPEED:
             self.cached_hooked_patches.setdefault(lora_hooks, {})
             self.cached_hooked_patches[lora_hooks][key] = out_weight
@@ -439,7 +477,7 @@ class CLIPWithHooks(CLIP):
 class ModelPatcherCLIPHooks(ModelPatcher):
     def __init__(self, m: ModelPatcher):
         # replicate ModelPatcher.clone() to initialize
-        super().__init__(m.model, m.load_device, m.offload_device, m.size, m.current_device, weight_inplace_update=m.weight_inplace_update)
+        super().__init__(m.model, m.load_device, m.offload_device, m.size, weight_inplace_update=m.weight_inplace_update)
         self.patches = {}
         for k in m.patches:
             self.patches[k] = m.patches[k][:]
@@ -594,7 +632,7 @@ class ModelPatcherCLIPHooks(ModelPatcher):
             else:
                 comfy.utils.set_attr_param(self.model, key, out_weight)
 
-    def patch_model(self, device_to=None, patch_weights=True, *args, **kwargs):
+    def patch_model(self, device_to=None, *args, **kwargs):
         if self.desired_lora_hooks is not None:
             self.patches_backup = self.patches.copy()
             relevant_patches = self.get_combined_hooked_patches(lora_hooks=self.desired_lora_hooks)
@@ -602,23 +640,29 @@ class ModelPatcherCLIPHooks(ModelPatcher):
                 self.patches.setdefault(key, [])
                 self.patches[key].extend(relevant_patches[key])
             self.current_lora_hooks = self.desired_lora_hooks
-        return super().patch_model(device_to, patch_weights, *args, **kwargs)
+        return super().patch_model(device_to, *args, **kwargs)
 
-    def patch_model_lowvram(self, *args, **kwargs):
+    def load(self, device_to=None, lowvram_model_memory=0, *args, **kwargs):
         try:
-            return super().patch_model_lowvram(*args, **kwargs)
+            return super().load(device_to=device_to, lowvram_model_memory=lowvram_model_memory, *args, **kwargs)
         finally:
-            # check if any modules have weight_function or bias_function that is not None
-            # NOTE: this serves no purpose currently, but I have it here for future reasons
-            for n, m in self.model.named_modules():
-                if not hasattr(m, "comfy_cast_weights"):
-                    continue
-                if getattr(m, "weight_function", None) is not None:
-                    self.model_params_lowvram = True
-                    self.model_params_lowvram_keys[f"{n}.weight"] = n
-                if getattr(m, "bias_function", None) is not None:
-                    self.model_params_lowvram = True
-                    self.model_params_lowvram_keys[f"{n}.weight"] = n
+            if lowvram_model_memory > 0:
+                self._patch_lowvram_extras()
+
+    def _patch_lowvram_extras(self):
+        # check if any modules have weight_function or bias_function that is not None
+        # NOTE: this serves no purpose currently, but I have it here for future reasons
+        self.model_params_lowvram = False
+        self.model_params_lowvram_keys.clear()
+        for n, m in self.model.named_modules():
+            if not hasattr(m, "comfy_cast_weights"):
+                continue
+            if getattr(m, "weight_function", None) is not None:
+                self.model_params_lowvram = True
+                self.model_params_lowvram_keys[f"{n}.weight"] = n
+            if getattr(m, "bias_function", None) is not None:
+                self.model_params_lowvram = True
+                self.model_params_lowvram_keys[f"{n}.weight"] = n
 
     def unpatch_model(self, device_to=None, unpatch_weights=True, *args, **kwargs):
         try:
@@ -721,8 +765,9 @@ class MotionModelPatcher(ModelPatcher):
         self.timestep_range: tuple[float, float] = None
         self.keyframes: ADKeyframeGroup = ADKeyframeGroup()
 
-        self.scale_multival = None
-        self.effect_multival = None
+        self.scale_multival: Union[float, Tensor, None] = None
+        self.effect_multival: Union[float, Tensor, None] = None
+        self.per_block_list: Union[list[PerBlock], None] = None
 
         # AnimateLCM-I2V
         self.orig_ref_drift: float = None
@@ -751,22 +796,29 @@ class MotionModelPatcher(ModelPatcher):
         self.current_used_steps = 0
         self.current_keyframe: ADKeyframe = None
         self.current_index = -1
+        self.previous_t = -1
         self.current_scale: Union[float, Tensor] = None
         self.current_effect: Union[float, Tensor] = None
         self.current_cameractrl_effect: Union[float, Tensor] = None
         self.current_pia_input: InputPIA = None
         self.combined_scale: Union[float, Tensor] = None
         self.combined_effect: Union[float, Tensor] = None
+        self.combined_per_block_list: Union[float, Tensor] = None
         self.combined_cameractrl_effect: Union[float, Tensor] = None
         self.combined_pia_mask: Union[float, Tensor] = None
         self.combined_pia_effect: Union[float, Tensor] = None
         self.was_within_range = False
         self.prev_sub_idxs = None
         self.prev_batched_number = None
-    
-    def patch_model_lowvram(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, *args, **kwargs):
-        patched_model = super().patch_model_lowvram(device_to, lowvram_model_memory, force_patch_weights, *args, **kwargs)
 
+    def load(self, device_to=None, lowvram_model_memory=0, *args, **kwargs):
+        to_return = super().load(device_to=device_to, lowvram_model_memory=lowvram_model_memory, *args, **kwargs)
+        if lowvram_model_memory > 0:
+            self._patch_lowvram_extras(device_to=device_to)
+        self._handle_float8_pe_tensors()
+        return to_return
+
+    def _patch_lowvram_extras(self, device_to=None):
         # figure out the tensors (likely pe's) that should be cast to device besides just the named_modules
         remaining_tensors = list(self.model.state_dict().keys())
         named_modules = []
@@ -783,12 +835,21 @@ class MotionModelPatcher(ModelPatcher):
             if device_to is not None:
                 comfy.utils.set_attr(self.model, key, comfy.utils.get_attr(self.model, key).to(device_to))
 
-        return patched_model
+    def _handle_float8_pe_tensors(self):
+        remaining_tensors = list(self.model.state_dict().keys())
+        pe_tensors = [x for x in remaining_tensors if '.pe' in x]
+        is_first = True
+        for key in pe_tensors:
+            if is_first:
+                is_first = False
+                if comfy.utils.get_attr(self.model, key).dtype not in [torch.float8_e5m2, torch.float8_e4m3fn]:
+                    break
+            comfy.utils.set_attr(self.model, key, comfy.utils.get_attr(self.model, key).half())
 
     def pre_run(self, model: ModelPatcherAndInjector):
         self.cleanup()
-        self.model.set_scale(self.scale_multival)
-        self.model.set_effect(self.effect_multival)
+        self.model.set_scale(self.scale_multival, self.per_block_list)
+        self.model.set_effect(self.effect_multival, self.per_block_list)
         self.model.set_cameractrl_effect(self.cameractrl_multival)
         if self.model.img_encoder is not None:
             self.model.img_encoder.set_ref_drift(self.orig_ref_drift)
@@ -803,6 +864,9 @@ class MotionModelPatcher(ModelPatcher):
 
     def prepare_current_keyframe(self, x: Tensor, t: Tensor):
         curr_t: float = t[0]
+        # if curr_t was previous_t, then do nothing (already accounted for this step)
+        if curr_t == self.previous_t:
+            return
         prev_index = self.current_index
         # if met guaranteed steps, look for next keyframe in case need to switch
         if self.current_keyframe is None or self.current_used_steps >= self.current_keyframe.guarantee_steps:
@@ -848,8 +912,8 @@ class MotionModelPatcher(ModelPatcher):
             self.combined_pia_mask = get_combined_input(self.pia_input, self.current_pia_input, x)
             self.combined_pia_effect = get_combined_input_effect_multival(self.pia_input, self.current_pia_input)
             # apply scale and effect
-            self.model.set_scale(self.combined_scale)
-            self.model.set_effect(self.combined_effect)
+            self.model.set_scale(self.combined_scale, self.per_block_list)
+            self.model.set_effect(self.combined_effect, self.per_block_list) # TODO: set combined_per_block_list
             self.model.set_cameractrl_effect(self.combined_cameractrl_effect)
         # apply effect - if not within range, set effect to 0, effectively turning model off
         if curr_t > self.timestep_range[0] or curr_t < self.timestep_range[1]:
@@ -858,10 +922,12 @@ class MotionModelPatcher(ModelPatcher):
         else:
             # if was not in range last step, apply effect to toggle AD status
             if not self.was_within_range:
-                self.model.set_effect(self.combined_effect)
+                self.model.set_effect(self.combined_effect, self.per_block_list)
                 self.was_within_range = True
         # update steps current keyframe is used
         self.current_used_steps += 1
+        # update previous_t
+        self.previous_t = curr_t
 
     def prepare_img_features(self, x: Tensor, cond_or_uncond: list[int], ad_params: dict[str], latent_format):
         # if no img_encoder, done
@@ -1006,17 +1072,19 @@ class MotionModelPatcher(ModelPatcher):
         self.current_used_steps = 0
         self.current_keyframe = None
         self.current_index = -1
+        self.previous_t = -1
         self.current_scale = None
         self.current_effect = None
         self.combined_scale = None
         self.combined_effect = None
+        self.combined_per_block_list = None
         self.was_within_range = False
         self.prev_sub_idxs = None
         self.prev_batched_number = None
 
     def clone(self):
         # normal ModelPatcher clone actions
-        n = MotionModelPatcher(self.model, self.load_device, self.offload_device, self.size, self.current_device, weight_inplace_update=self.weight_inplace_update)
+        n = MotionModelPatcher(self.model, self.load_device, self.offload_device, self.size, weight_inplace_update=self.weight_inplace_update)
         n.patches = {}
         for k in self.patches:
             n.patches[k] = self.patches[k][:]
@@ -1124,7 +1192,7 @@ class MotionModelGroup:
 
 
 def get_vanilla_model_patcher(m: ModelPatcher) -> ModelPatcher:
-    model = ModelPatcher(m.model, m.load_device, m.offload_device, m.size, m.current_device, weight_inplace_update=m.weight_inplace_update)
+    model = ModelPatcher(m.model, m.load_device, m.offload_device, m.size, weight_inplace_update=m.weight_inplace_update)
     model.patches = {}
     for k in m.patches:
         model.patches[k] = m.patches[k][:]
@@ -1335,6 +1403,14 @@ def validate_model_compatibility_gen2(model: ModelPatcher, motion_model: MotionM
     if model_sd_type != mm_info.sd_type:
         raise MotionCompatibilityError(f"Motion module '{mm_info.mm_name}' is intended for {mm_info.sd_type} models, " \
                                        + f"but the provided model is type {model_sd_type}.")
+
+
+def validate_per_block_compatibility(motion_model: MotionModelPatcher, all_per_blocks: AllPerBlocks):
+    if all_per_blocks is None or all_per_blocks.sd_type is None:
+        return
+    mm_info = motion_model.model.mm_info
+    if all_per_blocks.sd_type != mm_info.sd_type:
+        raise Exception(f"Per-Block provided is meant for {all_per_blocks.sd_type}, but provided motion module is for {mm_info.sd_type}.")
 
 
 def interpolate_pe_to_length(model_dict: dict[str, Tensor], key: str, new_length: int):
