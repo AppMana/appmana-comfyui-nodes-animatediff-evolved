@@ -21,9 +21,20 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["comfyui_animatediff_evolved"]
-package-dir = { "comfyui_animatediff_evolved" = "." }
+packages = [
+    "comfyui_animatediff_evolved",
+    "comfyui_animatediff_evolved.animatediff",
+    "comfyui_animatediff_evolved.animatediff.video_formats"
+]
+
+[tool.setuptools.package-dir]
+"comfyui_animatediff_evolved" = "."
+"comfyui_animatediff_evolved.animatediff" = "animatediff"
+"comfyui_animatediff_evolved.animatediff.video_formats" = "animatediff/video_formats"
 
 [project.entry-points."comfyui.custom_nodes"]
 comfyui_animatediff_evolved = "comfyui_animatediff_evolved.animatediff.nodes"
 comfyui_impact_pack_web_directory = "comfyui_animatediff_evolved"
+
+[tool.setuptools.package-data]
+"*" = ["**/*.js", "**/*.json"]
