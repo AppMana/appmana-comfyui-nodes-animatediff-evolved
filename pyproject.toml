@@ -3,7 +3,9 @@ name = "comfyui-animatediff-evolved"
 description = "Improved AnimateDiff integration for ComfyUI."
 version = "1.2.3"
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = [
+    "comfyui>=0.2.3"
+]
 
 [project.urls]
 Repository = "https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved"
