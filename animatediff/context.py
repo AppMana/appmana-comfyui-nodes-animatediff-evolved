@@ -12,6 +12,7 @@ from comfy.model_base import BaseModel
 from comfy.model_patcher import ModelPatcher
 
 from .context_extras import ContextExtrasGroup
+from .utils_model import BIGMAX_TENSOR
 from .utils_motion import get_sorted_list_via_attr
 
 
@@ -64,6 +65,12 @@ class ContextOptions:
         self._step = value
         if self.view_options:
             self.view_options.step = value
+
+    def get_effective_guarantee_steps(self, max_sigma: torch.Tensor):
+        '''If keyframe starts before current sampling range (max_sigma), treat as 0.'''
+        if self.start_t > max_sigma:
+            return 0
+        return self.guarantee_steps
 
     def clone(self):
         n = ContextOptions(context_length=self.context_length, context_stride=self.context_stride,
@@ -141,18 +148,19 @@ class ContextOptionsGroup:
             context.start_t = model.model_sampling.percent_to_sigma(context.start_percent)
         self.extras.initialize_timesteps(model)
 
-    def prepare_current(self, t: Tensor):
-        self.prepare_current_context(t)
-        self.extras.prepare_current(t)
+    def prepare_current(self, t: Tensor, transformer_options):
+        self.prepare_current_context(t, transformer_options)
+        self.extras.prepare_current(t, transformer_options)
 
-    def prepare_current_context(self, t: Tensor):
+    def prepare_current_context(self, t: Tensor, transformer_options: dict[str, Tensor]):
         curr_t: float = t[0]
         # if same as previous, do nothing as step already accounted for
         if curr_t == self._previous_t:
             return
         prev_index = self._current_index
+        max_sigma = torch.max(transformer_options.get("sample_sigmas", BIGMAX_TENSOR))
         # if met guaranteed steps, look for next context in case need to switch
-        if self._current_used_steps >= self._current_context.guarantee_steps:
+        if self._current_used_steps >= self._current_context.get_effective_guarantee_steps(max_sigma):
             # if has next index, loop through and see if need to switch
             if self.has_index(self._current_index+1):
                 for i in range(self._current_index+1, len(self.contexts)):
@@ -164,7 +172,7 @@ class ContextOptionsGroup:
                         self._current_context = eval_c
                         self._current_used_steps = 0
                         # if guarantee_steps greater than zero, stop searching for other keyframes
-                        if self._current_context.guarantee_steps > 0:
+                        if self._current_context.get_effective_guarantee_steps(max_sigma) > 0:
                             break
                     # if eval_c is outside the percent range, stop looking further
                     else:
@@ -604,9 +612,14 @@ def draw_view(window: list[int], gd: GridDisplay):
     draw_subidxs(window=window, gd=gd, y_grid_offset=2, color=gd.vs.view_color)
 
 
-def generate_context_visualization(context_opts: ContextOptionsGroup, model: ModelPatcher, sampler_name: str=None, scheduler: str=None,
+def generate_context_visualization(model: ModelPatcher, context_opts: ContextOptionsGroup=None, sampler_name: str=None, scheduler: str=None,
                                    width=1440, height=200, video_length=32,
                                    steps=None, start_step=None, end_step=None, sigmas=None, force_full_denoise=False, denoise=None):
+    if context_opts is None:
+        context_opts = ContextOptionsGroup.default()
+        params = model.get_attachment("ADE_params")
+        if params is not None:
+            context_opts = params.context_options
     context_opts = context_opts.clone()
     vs = VisualizeSettings(width, video_length)
     all_imgs = []
@@ -642,7 +655,9 @@ def generate_context_visualization(context_opts: ContextOptionsGroup, model: Mod
 
         # check if context should even be active in this case
         context_active = True
-        if video_length < context_opts.context_length:
+        if context_opts.context_length is None:
+            context_active = False
+        elif video_length < context_opts.context_length:
             context_active = False
         elif video_length == context_opts.context_length and not context_opts.use_on_equal_length:
             context_active = False

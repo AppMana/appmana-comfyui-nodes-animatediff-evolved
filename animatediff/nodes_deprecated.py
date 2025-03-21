@@ -17,10 +17,14 @@ from .ad_settings import AnimateDiffSettings, AdjustGroup, AdjustPE, AdjustWeigh
 from .context import ContextOptionsGroup, ContextOptions, ContextSchedules
 from .logger import logger
 from .utils_model import Folders, BetaSchedules, get_available_motion_models
-from .model_injection import ModelPatcherAndInjector, InjectionParams, MotionModelGroup, load_motion_module_gen1
+from .utils_motion import ADKeyframeGroup
+from .motion_lora import MotionLoraList
+from .model_injection import (ModelPatcherHelper, InjectionParams, MotionModelGroup, get_mm_attachment, load_motion_module_gen1)
+from .sampling import outer_sample_wrapper, sliding_calc_cond_batch
+from .sample_settings import SampleSettings
 
 
-class AnimateDiffLoader_Deprecated:
+class AnimateDiffLoaderDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -37,6 +41,7 @@ class AnimateDiffLoader_Deprecated:
     RETURN_TYPES = ("MODEL", "LATENT")
     CATEGORY = ""
     FUNCTION = "load_mm_and_inject_params"
+    DEPRECATED = True
 
     def load_mm_and_inject_params(
         self,
@@ -51,14 +56,17 @@ class AnimateDiffLoader_Deprecated:
         # set injection params
         params = InjectionParams(
                 unlimited_area_hack=unlimited_area_hack,
-                apply_mm_groupnorm_hack=True,
-                model_name=model_name,
                 apply_v2_properly=False,
         )
         # inject for use in sampling code
-        model = ModelPatcherAndInjector.create_from(model, hooks_only=True)
-        model.motion_models = MotionModelGroup(motion_model)
-        model.motion_injection_params = params
+        model = model.clone()
+        helper = ModelPatcherHelper(model)
+        helper.set_all_properties(
+            outer_sampler_wrapper=outer_sample_wrapper,
+            calc_cond_batch_wrapper=sliding_calc_cond_batch,
+            params=params,
+            motion_models=MotionModelGroup(motion_model),
+        )
 
         # save model sampling from BetaSchedule as object patch
         # if autoselect, get suggested beta_schedule from motion model
@@ -72,7 +80,7 @@ class AnimateDiffLoader_Deprecated:
         return (model, latents)
 
 
-class AnimateDiffLoaderAdvanced_Deprecated:
+class AnimateDiffLoaderAdvancedDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -94,6 +102,7 @@ class AnimateDiffLoaderAdvanced_Deprecated:
     RETURN_TYPES = ("MODEL", "LATENT")
     CATEGORY = ""
     FUNCTION = "load_mm_and_inject_params"
+    DEPRECATED = True
 
     def load_mm_and_inject_params(self,
             model: ModelPatcher,
@@ -109,8 +118,6 @@ class AnimateDiffLoaderAdvanced_Deprecated:
         # set injection params
         params = InjectionParams(
                 unlimited_area_hack=unlimited_area_hack,
-                apply_mm_groupnorm_hack=True,
-                model_name=model_name,
                 apply_v2_properly=False,
         )
         context_group = ContextOptionsGroup()
@@ -126,9 +133,14 @@ class AnimateDiffLoaderAdvanced_Deprecated:
         # set context settings
         params.set_context(context_options=context_group)
         # inject for use in sampling code
-        model = ModelPatcherAndInjector.create_from(model, hooks_only=True)
-        model.motion_models = MotionModelGroup(motion_model)
-        model.motion_injection_params = params
+        model = model.clone()
+        helper = ModelPatcherHelper(model)
+        helper.set_all_properties(
+            outer_sampler_wrapper=outer_sample_wrapper,
+            calc_cond_batch_wrapper=sliding_calc_cond_batch,
+            params=params,
+            motion_models=MotionModelGroup(motion_model),
+        )
 
         # save model sampling from BetaSchedule as object patch
         # if autoselect, get suggested beta_schedule from motion model
@@ -140,9 +152,98 @@ class AnimateDiffLoaderAdvanced_Deprecated:
 
         del motion_model
         return (model, latents)
-    
 
-class AnimateDiffCombine_Deprecated:
+
+class LegacyAnimateDiffLoaderWithContextDEPR:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "model_name": (get_available_motion_models(),),
+                "beta_schedule": (BetaSchedules.ALIAS_LIST, {"default": BetaSchedules.AUTOSELECT}),
+                #"apply_mm_groupnorm_hack": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "context_options": ("CONTEXT_OPTIONS",),
+                "motion_lora": ("MOTION_LORA",),
+                "ad_settings": ("AD_SETTINGS",),
+                "sample_settings": ("SAMPLE_SETTINGS",),
+                "motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
+                "apply_v2_models_properly": ("BOOLEAN", {"default": True}),
+                "ad_keyframes": ("AD_KEYFRAMES",),
+                "deprecation_warning": ("ADEWARN", {"text": "Deprecated; use AnimateDiff Loader instead."}),
+            }
+        }
+    
+    DEPRECATED = True
+    RETURN_TYPES = ("MODEL",)
+    CATEGORY = "Animate Diff 🎭🅐🅓/① Gen1 nodes ①"
+    FUNCTION = "load_mm_and_inject_params"
+
+    def load_mm_and_inject_params(self,
+        model: ModelPatcher,
+        model_name: str, beta_schedule: str,# apply_mm_groupnorm_hack: bool,
+        context_options: ContextOptionsGroup=None, motion_lora: MotionLoraList=None, ad_settings: AnimateDiffSettings=None, motion_model_settings: AnimateDiffSettings=None,
+        sample_settings: SampleSettings=None, motion_scale: float=1.0, apply_v2_models_properly: bool=False, ad_keyframes: ADKeyframeGroup=None,
+    ):
+        if ad_settings is not None:
+            motion_model_settings = ad_settings
+        # load motion module
+        motion_model = load_motion_module_gen1(model_name, model, motion_lora=motion_lora, motion_model_settings=motion_model_settings)
+        # set injection params
+        params = InjectionParams(
+                unlimited_area_hack=False,
+                apply_v2_properly=apply_v2_models_properly,
+        )
+        if context_options:
+            params.set_context(context_options)
+        # set motion_scale and motion_model_settings
+        if not motion_model_settings:
+            motion_model_settings = AnimateDiffSettings()
+        motion_model_settings.attn_scale = motion_scale
+        params.set_motion_model_settings(motion_model_settings)
+
+        attachment = get_mm_attachment(motion_model)
+        if params.motion_model_settings.mask_attn_scale is not None:
+            attachment.scale_multival = params.motion_model_settings.mask_attn_scale * params.motion_model_settings.attn_scale
+        else:
+            attachment.scale_multival = params.motion_model_settings.attn_scale
+
+        attachment.keyframes = ad_keyframes.clone() if ad_keyframes else ADKeyframeGroup()
+
+        # need to use a ModelPatcher that supports injection of motion modules into unet
+        model = model.clone()
+        helper = ModelPatcherHelper(model)
+        helper.set_all_properties(
+            outer_sampler_wrapper=outer_sample_wrapper,
+            calc_cond_batch_wrapper=sliding_calc_cond_batch,
+            params=params,
+            sample_settings=sample_settings,
+            motion_models=MotionModelGroup(motion_model),
+        )
+
+        sample_settings = helper.get_sample_settings()
+        if sample_settings.custom_cfg is not None:
+            logger.info("[Sample Settings] custom_cfg is set; will override any KSampler cfg values or patches.")
+
+        if sample_settings.sigma_schedule is not None:
+            logger.info("[Sample Settings] sigma_schedule is set; will override beta_schedule.")
+            model.add_object_patch("model_sampling", sample_settings.sigma_schedule.clone().model_sampling)
+        else:
+            # save model sampling from BetaSchedule as object patch
+            # if autoselect, get suggested beta_schedule from motion model
+            if beta_schedule == BetaSchedules.AUTOSELECT and helper.get_motion_models():
+                beta_schedule = helper.get_motion_models()[0].model.get_best_beta_schedule(log=True)
+            new_model_sampling = BetaSchedules.to_model_sampling(beta_schedule, model)
+            if new_model_sampling is not None:
+                model.add_object_patch("model_sampling", new_model_sampling)
+
+        del motion_model
+        return (model,)
+
+
+class AnimateDiffCombineDEPR:
     ffmpeg_warning_already_shown = False
     @classmethod
     def INPUT_TYPES(s):
@@ -181,6 +282,7 @@ class AnimateDiffCombine_Deprecated:
     OUTPUT_NODE = True
     CATEGORY = ""
     FUNCTION = "generate_gif"
+    DEPRECATED = True
 
     def generate_gif(
         self,
@@ -284,7 +386,7 @@ class AnimateDiffCombine_Deprecated:
 
 
 
-class AnimateDiffModelSettings:
+class AnimateDiffModelSettingsDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -301,6 +403,7 @@ class AnimateDiffModelSettings:
     RETURN_TYPES = ("AD_SETTINGS",)
     CATEGORY = ""  #"Animate Diff 🎭🅐🅓/① Gen1 nodes ①/motion settings"
     FUNCTION = "get_motion_model_settings"
+    DEPRECATED = True
 
     def get_motion_model_settings(self, mask_motion_scale: torch.Tensor=None, min_motion_scale: float=1.0, max_motion_scale: float=1.0):
         motion_model_settings = AnimateDiffSettings(
@@ -312,7 +415,7 @@ class AnimateDiffModelSettings:
         return (motion_model_settings,)
 
 
-class AnimateDiffModelSettingsSimple:
+class AnimateDiffModelSettingsSimpleDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -330,6 +433,7 @@ class AnimateDiffModelSettingsSimple:
     RETURN_TYPES = ("AD_SETTINGS",)
     CATEGORY = ""  #"Animate Diff 🎭🅐🅓/① Gen1 nodes ①/motion settings/experimental"
     FUNCTION = "get_motion_model_settings"
+    DEPRECATED = True
 
     def get_motion_model_settings(self, motion_pe_stretch: int,
                                   mask_motion_scale: torch.Tensor=None, min_motion_scale: float=1.0, max_motion_scale: float=1.0):
@@ -344,7 +448,7 @@ class AnimateDiffModelSettingsSimple:
         return (motion_model_settings,)
 
 
-class AnimateDiffModelSettingsAdvanced:
+class AnimateDiffModelSettingsAdvancedDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -369,6 +473,7 @@ class AnimateDiffModelSettingsAdvanced:
     RETURN_TYPES = ("AD_SETTINGS",)
     CATEGORY = ""  #"Animate Diff 🎭🅐🅓/① Gen1 nodes ①/motion settings/experimental"
     FUNCTION = "get_motion_model_settings"
+    DEPRECATED = True
 
     def get_motion_model_settings(self, pe_strength: float, attn_strength: float, other_strength: float,
                                   motion_pe_stretch: int,
@@ -394,7 +499,7 @@ class AnimateDiffModelSettingsAdvanced:
         return (motion_model_settings,)
 
 
-class AnimateDiffModelSettingsAdvancedAttnStrengths:
+class AnimateDiffModelSettingsAdvancedAttnStrengthsDEPR:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -424,6 +529,7 @@ class AnimateDiffModelSettingsAdvancedAttnStrengths:
     RETURN_TYPES = ("AD_SETTINGS",)
     CATEGORY = ""  #"Animate Diff 🎭🅐🅓/① Gen1 nodes ①/motion settings/experimental"
     FUNCTION = "get_motion_model_settings"
+    DEPRECATED = True
 
     def get_motion_model_settings(self, pe_strength: float, attn_strength: float,
                                   attn_q_strength: float,

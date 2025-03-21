@@ -2,9 +2,7 @@ import comfy.sample as comfy_sample
 from comfy.cmd import folder_paths
 from . import documentation
 
-from .sampling import motion_sample_factory
-
-from .nodes_gen1 import (AnimateDiffLoaderGen1, LegacyAnimateDiffLoaderWithContext)
+from .nodes_gen1 import (AnimateDiffLoaderGen1,)
 from .nodes_gen2 import (UseEvolvedSamplingNode, ApplyAnimateDiffModelNode, ApplyAnimateDiffModelBasicNode, ADKeyframeNode,
                          LoadAnimateDiffModelNode)
 from .nodes_animatelcmi2v import (ApplyAnimateLCMI2VModel, LoadAnimateLCMI2VModelNode, LoadAnimateDiffAndInjectI2VNode, UpscaleAndVaeEncode)
@@ -12,21 +10,25 @@ from .nodes_cameractrl import (LoadAnimateDiffModelWithCameraCtrl, ApplyAnimateD
                                LoadCameraPosesFromFile, LoadCameraPosesFromPath,
                                CameraCtrlPoseBasic, CameraCtrlPoseCombo, CameraCtrlPoseAdvanced, CameraCtrlManualAppendPose,
                                CameraCtrlReplaceCameraParameters, CameraCtrlSetOriginalAspectRatio)
+from .nodes_motionctrl import (LoadMotionCtrlCMCM, LoadMotionCtrlOMCM, ApplyAnimateDiffMotionCtrlModel, LoadMotionCtrlCameraPosesFromFile)
 from .nodes_pia import (ApplyAnimateDiffPIAModel, LoadAnimateDiffAndInjectPIANode, InputPIA_MultivalNode, InputPIA_PaperPresetsNode, PIA_ADKeyframeNode)
+from .nodes_fancyvideo import (ApplyAnimateDiffFancyVideo,)
+from .nodes_hellomeme import (TestHMRefNetInjection,)
 from .nodes_multival import MultivalDynamicNode, MultivalScaledMaskNode, MultivalDynamicFloatInputNode, MultivalDynamicFloatsNode, MultivalConvertToMaskNode
-from .nodes_conditioning import (MaskableLoraLoader, MaskableLoraLoaderModelOnly, MaskableSDModelLoader, MaskableSDModelLoaderModelOnly,
-                                 SetModelLoraHook, SetClipLoraHook,
-                                 CombineLoraHooks, CombineLoraHookFourOptional, CombineLoraHookEightOptional,
-                                 PairedConditioningSetMaskHooked, ConditioningSetMaskHooked,
-                                 PairedConditioningSetMaskAndCombineHooked, ConditioningSetMaskAndCombineHooked,
-                                 PairedConditioningSetUnmaskedAndCombineHooked, ConditioningSetUnmaskedAndCombineHooked,
-                                 PairedConditioningCombine, ConditioningCombine,
-                                 ConditioningTimestepsNode, SetLoraHookKeyframes,
-                                 CreateLoraHookKeyframe, CreateLoraHookKeyframeInterpolation, CreateLoraHookKeyframeFromStrengthList)
-from .nodes_sample import (FreeInitOptionsNode, NoiseLayerAddWeightedNode, SampleSettingsNode, NoiseLayerAddNode, NoiseLayerReplaceNode, IterationOptionsNode,
+from .nodes_conditioning import (CreateLoraHookKeyframeInterpolationDEPR,
+                                 MaskableLoraLoaderDEPR, MaskableLoraLoaderModelOnlyDEPR, MaskableSDModelLoaderDEPR, MaskableSDModelLoaderModelOnlyDEPR, 
+                                 SetModelLoraHookDEPR, SetClipLoraHookDEPR,
+                                 CombineLoraHooksDEPR, CombineLoraHookFourOptionalDEPR, CombineLoraHookEightOptionalDEPR,
+                                 PairedConditioningSetMaskHookedDEPR, ConditioningSetMaskHookedDEPR,
+                                 PairedConditioningSetMaskAndCombineHookedDEPR, ConditioningSetMaskAndCombineHookedDEPR,
+                                 PairedConditioningSetUnmaskedAndCombineHookedDEPR, ConditioningSetUnmaskedAndCombineHookedDEPR,
+                                 PairedConditioningCombineDEPR, ConditioningCombineDEPR,
+                                 ConditioningTimestepsNodeDEPR, SetLoraHookKeyframesDEPR,
+                                 CreateLoraHookKeyframeDEPR, CreateLoraHookKeyframeFromStrengthListDEPR)
+from .nodes_sample import (FreeInitOptionsNode, NoiseLayerAddWeightedNode, NoiseLayerNormalizedSumNode, SampleSettingsNode, NoiseLayerAddNode, NoiseLayerReplaceNode, IterationOptionsNode,
                            CustomCFGNode, CustomCFGSimpleNode, CustomCFGKeyframeNode, CustomCFGKeyframeSimpleNode, CustomCFGKeyframeInterpolationNode, CustomCFGKeyframeFromListNode,
                            CFGExtrasPAGNode, CFGExtrasPAGSimpleNode, CFGExtrasRescaleCFGNode, CFGExtrasRescaleCFGSimpleNode,
-                           NoisedImageInjectionNode, NoisedImageInjectOptionsNode)
+                           NoisedImageInjectionNode, NoisedImageInjectOptionsNode, NoiseCalibrationNode, AncestralOptionsNode)
 from .nodes_sigma_schedule import (SigmaScheduleNode, RawSigmaScheduleNode, WeightedAverageSigmaScheduleNode, InterpolatedWeightedAverageSigmaScheduleNode, SplitAndCombineSigmaScheduleNode, SigmaScheduleToSigmasNode)
 from .nodes_context import (LegacyLoopedUniformContextOptionsNode, LoopedUniformContextOptionsNode, LoopedUniformViewOptionsNode, StandardUniformContextOptionsNode, StandardStaticContextOptionsNode, BatchedContextOptionsNode,
                             StandardStaticViewOptionsNode, StandardUniformViewOptionsNode, ViewAsContextOptionsNode,
@@ -45,16 +47,12 @@ from .nodes_per_block import (ADBlockComboNode, ADBlockIndivNode, PerBlockHighLe
                               PerBlock_SD15_LowLevelNode, PerBlock_SD15_MidLevelNode, PerBlock_SD15_FromFloatsNode,
                               PerBlock_SDXL_LowLevelNode, PerBlock_SDXL_MidLevelNode, PerBlock_SDXL_FromFloatsNode)
 from .nodes_extras import AnimateDiffUnload, EmptyLatentImageLarge, CheckpointLoaderSimpleWithNoiseSelect, PerturbedAttentionGuidanceMultival, RescaleCFGMultival
-from .nodes_deprecated import (AnimateDiffLoader_Deprecated, AnimateDiffLoaderAdvanced_Deprecated, AnimateDiffCombine_Deprecated,
-                               AnimateDiffModelSettings, AnimateDiffModelSettingsSimple, AnimateDiffModelSettingsAdvanced, AnimateDiffModelSettingsAdvancedAttnStrengths)
+from .nodes_deprecated import (AnimateDiffLoaderDEPR, AnimateDiffLoaderAdvancedDEPR, LegacyAnimateDiffLoaderWithContextDEPR, AnimateDiffCombineDEPR,
+                               AnimateDiffModelSettingsDEPR, AnimateDiffModelSettingsSimpleDEPR, AnimateDiffModelSettingsAdvancedDEPR, AnimateDiffModelSettingsAdvancedAttnStrengthsDEPR)
 from .nodes_lora import AnimateDiffLoraLoader
 
 from .logger import *
 from .utils_model import Folders
-
-# override comfy_sample.sample with animatediff-support version
-comfy_sample.sample = motion_sample_factory(comfy_sample.sample)
-comfy_sample.sample_custom = motion_sample_factory(comfy_sample.sample_custom, is_custom=True)
 
 folder_paths.add_model_folder_path(Folders.ANIMATEDIFF_MODELS, extensions=folder_paths.supported_pt_extensions)
 folder_paths.add_model_folder_path(Folders.MOTION_LORA, extensions=folder_paths.supported_pt_extensions)
@@ -108,31 +106,33 @@ NODE_CLASS_MAPPINGS = {
     "ADE_IterationOptsDefault": IterationOptionsNode,
     "ADE_IterationOptsFreeInit": FreeInitOptionsNode,
     # Conditioning
-    "ADE_RegisterLoraHook": MaskableLoraLoader,
-    "ADE_RegisterLoraHookModelOnly": MaskableLoraLoaderModelOnly,
-    "ADE_RegisterModelAsLoraHook": MaskableSDModelLoader,
-    "ADE_RegisterModelAsLoraHookModelOnly": MaskableSDModelLoaderModelOnly,
-    "ADE_CombineLoraHooks": CombineLoraHooks,
-    "ADE_CombineLoraHooksFour": CombineLoraHookFourOptional,
-    "ADE_CombineLoraHooksEight": CombineLoraHookEightOptional,
-    "ADE_SetLoraHookKeyframe": SetLoraHookKeyframes,
-    "ADE_AttachLoraHookToCLIP": SetClipLoraHook,
-    "ADE_LoraHookKeyframe": CreateLoraHookKeyframe,
-    "ADE_LoraHookKeyframeInterpolation": CreateLoraHookKeyframeInterpolation,
-    "ADE_LoraHookKeyframeFromStrengthList": CreateLoraHookKeyframeFromStrengthList,
-    "ADE_AttachLoraHookToConditioning": SetModelLoraHook,
-    "ADE_PairedConditioningSetMask": PairedConditioningSetMaskHooked,
-    "ADE_ConditioningSetMask": ConditioningSetMaskHooked,
-    "ADE_PairedConditioningSetMaskAndCombine": PairedConditioningSetMaskAndCombineHooked,
-    "ADE_ConditioningSetMaskAndCombine": ConditioningSetMaskAndCombineHooked,
-    "ADE_PairedConditioningSetUnmaskedAndCombine": PairedConditioningSetUnmaskedAndCombineHooked,
-    "ADE_ConditioningSetUnmaskedAndCombine": ConditioningSetUnmaskedAndCombineHooked,
-    "ADE_PairedConditioningCombine": PairedConditioningCombine,
-    "ADE_ConditioningCombine": ConditioningCombine,
-    "ADE_TimestepsConditioning": ConditioningTimestepsNode,
+    # Conditioning (DEPRECATED)
+    "ADE_RegisterLoraHook": MaskableLoraLoaderDEPR,
+    "ADE_RegisterLoraHookModelOnly": MaskableLoraLoaderModelOnlyDEPR,
+    "ADE_RegisterModelAsLoraHook": MaskableSDModelLoaderDEPR,
+    "ADE_RegisterModelAsLoraHookModelOnly": MaskableSDModelLoaderModelOnlyDEPR,
+    "ADE_CombineLoraHooks": CombineLoraHooksDEPR,
+    "ADE_CombineLoraHooksFour": CombineLoraHookFourOptionalDEPR,
+    "ADE_CombineLoraHooksEight": CombineLoraHookEightOptionalDEPR,
+    "ADE_SetLoraHookKeyframe": SetLoraHookKeyframesDEPR,
+    "ADE_AttachLoraHookToCLIP": SetClipLoraHookDEPR,
+    "ADE_LoraHookKeyframe": CreateLoraHookKeyframeDEPR,
+    "ADE_LoraHookKeyframeInterpolation": CreateLoraHookKeyframeInterpolationDEPR,
+    "ADE_LoraHookKeyframeFromStrengthList": CreateLoraHookKeyframeFromStrengthListDEPR,
+    "ADE_AttachLoraHookToConditioning": SetModelLoraHookDEPR,
+    "ADE_PairedConditioningSetMask": PairedConditioningSetMaskHookedDEPR,
+    "ADE_ConditioningSetMask": ConditioningSetMaskHookedDEPR,
+    "ADE_PairedConditioningSetMaskAndCombine": PairedConditioningSetMaskAndCombineHookedDEPR,
+    "ADE_ConditioningSetMaskAndCombine": ConditioningSetMaskAndCombineHookedDEPR,
+    "ADE_PairedConditioningSetUnmaskedAndCombine": PairedConditioningSetUnmaskedAndCombineHookedDEPR,
+    "ADE_ConditioningSetUnmaskedAndCombine": ConditioningSetUnmaskedAndCombineHookedDEPR,
+    "ADE_PairedConditioningCombine": PairedConditioningCombineDEPR,
+    "ADE_ConditioningCombine": ConditioningCombineDEPR,
+    "ADE_TimestepsConditioning": ConditioningTimestepsNodeDEPR,
     # Noise Layer Nodes
     "ADE_NoiseLayerAdd": NoiseLayerAddNode,
     "ADE_NoiseLayerAddWeighted": NoiseLayerAddWeightedNode,
+    "ADE_NoiseLayerNormalizedSum": NoiseLayerNormalizedSumNode,
     "ADE_NoiseLayerReplace": NoiseLayerReplaceNode,
     # AnimateDiff Settings
     "ADE_AnimateDiffSettings": AnimateDiffSettingsNode,
@@ -164,6 +164,8 @@ NODE_CLASS_MAPPINGS = {
     "ADE_SigmaScheduleToSigmas": SigmaScheduleToSigmasNode,
     "ADE_NoisedImageInjection": NoisedImageInjectionNode,
     "ADE_NoisedImageInjectOptions": NoisedImageInjectOptionsNode,
+    "ADE_AncestralOptions": AncestralOptionsNode,
+    #"ADE_NoiseCalibration": NoiseCalibrationNode,
     # Scheduling
     PromptSchedulingNode.NodeID: PromptSchedulingNode,
     PromptSchedulingLatentsNode.NodeID: PromptSchedulingLatentsNode,
@@ -189,7 +191,6 @@ NODE_CLASS_MAPPINGS = {
     "ADE_RescaleCFGMultival": RescaleCFGMultival,
     # Gen1 Nodes
     "ADE_AnimateDiffLoaderGen1": AnimateDiffLoaderGen1,
-    "ADE_AnimateDiffLoaderWithContext": LegacyAnimateDiffLoaderWithContext,
     # Gen2 Nodes
     "ADE_UseEvolvedSampling": UseEvolvedSamplingNode,
     "ADE_ApplyAnimateDiffModelSimple": ApplyAnimateDiffModelBasicNode,
@@ -200,6 +201,11 @@ NODE_CLASS_MAPPINGS = {
     "ADE_LoadAnimateLCMI2VModel": LoadAnimateLCMI2VModelNode,
     "ADE_UpscaleAndVAEEncode": UpscaleAndVaeEncode,
     "ADE_InjectI2VIntoAnimateDiffModel": LoadAnimateDiffAndInjectI2VNode,
+    # MotionCtrl Nodes
+    #LoadMotionCtrlCMCM.NodeID: LoadMotionCtrlCMCM,
+    #LoadMotionCtrlOMCM.NodeID: LoadMotionCtrlOMCM,
+    #ApplyAnimateDiffMotionCtrlModel.NodeID: ApplyAnimateDiffMotionCtrlModel,
+    #LoadMotionCtrlCameraPosesFromFile.NodeID: LoadMotionCtrlCameraPosesFromFile,
     # CameraCtrl Nodes
     "ADE_ApplyAnimateDiffModelWithCameraCtrl": ApplyAnimateDiffWithCameraCtrl,
     "ADE_LoadAnimateDiffModelWithCameraCtrl": LoadAnimateDiffModelWithCameraCtrl,
@@ -218,14 +224,19 @@ NODE_CLASS_MAPPINGS = {
     "ADE_InputPIA_PaperPresets": InputPIA_PaperPresetsNode,
     "ADE_PIA_AnimateDiffKeyframe": PIA_ADKeyframeNode,
     "ADE_InjectPIAIntoAnimateDiffModel": LoadAnimateDiffAndInjectPIANode,
+    # FancyVideo
+    #ApplyAnimateDiffFancyVideo.NodeID: ApplyAnimateDiffFancyVideo,
+    # HelloMeme
+    #TestHMRefNetInjection.NodeID: TestHMRefNetInjection,
     # Deprecated Nodes
-    "AnimateDiffLoaderV1": AnimateDiffLoader_Deprecated,
-    "ADE_AnimateDiffLoaderV1Advanced": AnimateDiffLoaderAdvanced_Deprecated,
-    "ADE_AnimateDiffCombine": AnimateDiffCombine_Deprecated,
-    "ADE_AnimateDiffModelSettings_Release": AnimateDiffModelSettings,
-    "ADE_AnimateDiffModelSettingsSimple": AnimateDiffModelSettingsSimple,
-    "ADE_AnimateDiffModelSettings": AnimateDiffModelSettingsAdvanced,
-    "ADE_AnimateDiffModelSettingsAdvancedAttnStrengths": AnimateDiffModelSettingsAdvancedAttnStrengths,
+    "ADE_AnimateDiffLoaderWithContext": LegacyAnimateDiffLoaderWithContextDEPR,
+    "AnimateDiffLoaderV1": AnimateDiffLoaderDEPR,
+    "ADE_AnimateDiffLoaderV1Advanced": AnimateDiffLoaderAdvancedDEPR,
+    "ADE_AnimateDiffCombine": AnimateDiffCombineDEPR,
+    "ADE_AnimateDiffModelSettings_Release": AnimateDiffModelSettingsDEPR,
+    "ADE_AnimateDiffModelSettingsSimple": AnimateDiffModelSettingsSimpleDEPR,
+    "ADE_AnimateDiffModelSettings": AnimateDiffModelSettingsAdvancedDEPR,
+    "ADE_AnimateDiffModelSettingsAdvancedAttnStrengths": AnimateDiffModelSettingsAdvancedAttnStrengthsDEPR,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     # Unencapsulated
@@ -275,6 +286,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_IterationOptsDefault": "Default Iteration Options 🎭🅐🅓",
     "ADE_IterationOptsFreeInit": "FreeInit Iteration Options 🎭🅐🅓",
     # Conditioning
+    # Conditioning (DEPRECATED)
     "ADE_RegisterLoraHook": "Register LoRA Hook 🎭🅐🅓",
     "ADE_RegisterLoraHookModelOnly": "Register LoRA Hook (Model Only) 🎭🅐🅓",
     "ADE_RegisterModelAsLoraHook": "Register Model as LoRA Hook 🎭🅐🅓",
@@ -300,6 +312,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     # Noise Layer Nodes
     "ADE_NoiseLayerAdd": "Noise Layer [Add] 🎭🅐🅓",
     "ADE_NoiseLayerAddWeighted": "Noise Layer [Add Weighted] 🎭🅐🅓",
+    "ADE_NoiseLayerNormalizedSum": "Noise Layer [Normalized Sum] 🎭🅐🅓",
     "ADE_NoiseLayerReplace": "Noise Layer [Replace] 🎭🅐🅓",
     # AnimateDiff Settings
     "ADE_AnimateDiffSettings": "AnimateDiff Settings 🎭🅐🅓",
@@ -331,6 +344,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_SigmaScheduleToSigmas": "Sigma Schedule To Sigmas 🎭🅐🅓",
     "ADE_NoisedImageInjection": "Image Injection 🎭🅐🅓",
     "ADE_NoisedImageInjectOptions": "Image Injection Options 🎭🅐🅓",
+    "ADE_NoiseCalibration": "Noise Calibration 🎭🅐🅓",
+    "ADE_AncestralOptions": "Ancestral Options 🎭🅐🅓",
     # Scheduling
     PromptSchedulingNode.NodeID: PromptSchedulingNode.NodeName,
     PromptSchedulingLatentsNode.NodeID: PromptSchedulingLatentsNode.NodeName,
@@ -356,7 +371,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_RescaleCFGMultival": "RescaleCFG [Multival] 🎭🅐🅓",
     # Gen1 Nodes
     "ADE_AnimateDiffLoaderGen1": "AnimateDiff Loader 🎭🅐🅓①",
-    "ADE_AnimateDiffLoaderWithContext": "AnimateDiff Loader [Legacy] 🎭🅐🅓①",
     # Gen2 Nodes
     "ADE_UseEvolvedSampling": "Use Evolved Sampling 🎭🅐🅓②",
     "ADE_ApplyAnimateDiffModelSimple": "Apply AnimateDiff Model 🎭🅐🅓②",
@@ -367,6 +381,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_LoadAnimateLCMI2VModel": "Load AnimateLCM-I2V Model 🎭🅐🅓②",
     "ADE_UpscaleAndVAEEncode": "Scale Ref Image and VAE Encode 🎭🅐🅓②",
     "ADE_InjectI2VIntoAnimateDiffModel": "🧪Inject I2V into AnimateDiff Model 🎭🅐🅓②",
+    # MotionCtrl Nodes
+    LoadMotionCtrlCMCM.NodeID: LoadMotionCtrlCMCM.NodeName,
+    LoadMotionCtrlOMCM.NodeID: LoadMotionCtrlOMCM.NodeName,
+    ApplyAnimateDiffMotionCtrlModel.NodeID: ApplyAnimateDiffMotionCtrlModel.NodeName,
     # CameraCtrl Nodes
     "ADE_ApplyAnimateDiffModelWithCameraCtrl": "Apply AnimateDiff+CameraCtrl Model 🎭🅐🅓②",
     "ADE_LoadAnimateDiffModelWithCameraCtrl": "Load AnimateDiff+CameraCtrl Model 🎭🅐🅓②",
@@ -385,7 +403,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ADE_InputPIA_PaperPresets": "PIA Input [Paper Presets] 🎭🅐🅓②",
     "ADE_PIA_AnimateDiffKeyframe": "AnimateDiff-PIA Keyframe 🎭🅐🅓",
     "ADE_InjectPIAIntoAnimateDiffModel": "🧪Inject PIA into AnimateDiff Model 🎭🅐🅓②",
+    # FancyVideo
+    ApplyAnimateDiffFancyVideo.NodeID: ApplyAnimateDiffFancyVideo.NodeName,
+    # HelloMeme
+    TestHMRefNetInjection.NodeID: TestHMRefNetInjection.NodeName,
     # Deprecated Nodes
+    "ADE_AnimateDiffLoaderWithContext": "AnimateDiff Loader [Legacy] 🎭🅐🅓①",
     "AnimateDiffLoaderV1": "🚫AnimateDiff Loader [DEPRECATED] 🎭🅐🅓",
     "ADE_AnimateDiffLoaderV1Advanced": "🚫AnimateDiff Loader (Advanced) [DEPRECATED] 🎭🅐🅓",
     "ADE_AnimateDiffCombine": "🚫AnimateDiff Combine [DEPRECATED, Use Video Combine (VHS) Instead!] 🎭🅐🅓",

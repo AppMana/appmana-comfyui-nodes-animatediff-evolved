@@ -1,7 +1,7 @@
+from __future__ import annotations
 import math
 from typing import Iterable, Tuple, Union, TYPE_CHECKING
 import re
-from dataclasses import dataclass
 from collections.abc import Iterable as IterColl
 
 import torch
@@ -11,10 +11,11 @@ from torch import Tensor, nn
 from comfy.ldm.modules.attention import FeedForward, SpatialTransformer
 from comfy.model_patcher import ModelPatcher
 from comfy.model_base import BaseModel
+from comfy.ldm.modules.diffusionmodules.util import timestep_embedding
 from comfy.ldm.modules.diffusionmodules import openaimodel
 from comfy.ldm.modules.diffusionmodules.openaimodel import SpatialTransformer
 from comfy.controlnet import broadcast_image_to
-from comfy.utils import repeat_to_batch_size
+import comfy.utils
 import comfy.ops
 import comfy.model_management
 
@@ -22,7 +23,10 @@ from .context import ContextFuseMethod, ContextOptions, get_context_weights, get
 from .adapter_animatelcm_i2v import AdapterEmbed
 if TYPE_CHECKING:  # avoids circular import
     from .adapter_cameractrl import CameraPoseEncoder
-from .utils_motion import (CrossAttentionMM, MotionCompatibilityError, DummyNNModule, extend_to_batch_size, extend_list_to_batch_size,
+from .adapter_fancyvideo import FancyVideoCondEmbedding, FancyVideoKeys, initialize_weights_to_zero
+from .utils_motion import (CrossAttentionMM, MotionCompatibilityError, DummyNNModule,
+                           PerBlock, PerBlockId,
+                           extend_to_batch_size, extend_list_to_batch_size,
                            prepare_mask_batch, get_combined_multival)
 from .utils_model import BetaSchedules, ModelTypeSD
 from .logger import logger
@@ -40,8 +44,9 @@ class AnimateDiffFormat:
     HOTSHOTXL = "HotshotXL"
     ANIMATELCM = "AnimateLCM"
     PIA = "PIA"
+    FANCYVIDEO = "FancyVideo"
 
-    _LIST = [ANIMATEDIFF, HOTSHOTXL, ANIMATELCM, PIA]
+    _LIST = [ANIMATEDIFF, HOTSHOTXL, ANIMATELCM, PIA, FANCYVIDEO]
 
 
 class AnimateDiffVersion:
@@ -63,61 +68,6 @@ class AnimateDiffInfo:
         return f"{self.mm_name}:{self.mm_version}:{self.mm_format}:{self.sd_type}"
 
 
-#######################
-# Facilitate Per-Block Effect and Scale Control
-class PerAttn:
-    def __init__(self, attn_idx: Union[int, None], scale: Union[float, Tensor, None]):
-        self.attn_idx = attn_idx
-        self.scale = scale
-    
-    def matches(self, id: int):
-        if self.attn_idx is None:
-            return True
-        return self.attn_idx == id
-
-
-class PerBlockId:
-    def __init__(self, block_type: str, block_idx: Union[int, None]=None, module_idx: Union[int, None]=None):
-        self.block_type = block_type
-        self.block_idx = block_idx
-        self.module_idx = module_idx
-    
-    def matches(self, other: 'PerBlockId') -> bool:
-        # block_type
-        if other.block_type != self.block_type:
-            return False
-        # block_idx
-        if other.block_idx is None:
-            return True
-        elif other.block_idx != self.block_idx:
-            return False
-        # module_idx
-        if other.module_idx is None:
-            return True
-        return other.module_idx == self.module_idx
-    
-    def __str__(self):
-        return f"PerBlockId({self.block_type},{self.block_idx},{self.module_idx})"
-
-
-class PerBlock:
-    def __init__(self, id: PerBlockId, effect: Union[float, Tensor, None]=None,
-                 scales: Union[list[Union[float, Tensor, None]], None]=None):
-        self.id = id
-        self.effect = effect
-        self.scales = scales
-
-    def matches(self, id: PerBlockId):
-        return self.id.matches(id)
-    
-
-@dataclass
-class AllPerBlocks:
-    per_block_list: list[PerBlock]
-    sd_type: Union[str, None] = None
-#----------------------
-#######################
-
 def is_hotshotxl(mm_state_dict: dict[str, Tensor]) -> bool:
     # use pos_encoder naming to determine if hotshotxl model
     for key in mm_state_dict.keys():
@@ -133,19 +83,36 @@ def is_animatelcm(mm_state_dict: dict[str, Tensor]) -> bool:
             return False
     return True
 
+def is_hellomeme(mm_state_dict: dict[str, Tensor]) -> bool:
+    for key in mm_state_dict.keys():
+        if "pos_embed" in key:
+            return True
+    return False
 
-def is_pia(mm_state_dict: dict[str, Tensor]) -> bool:
+def has_conv_in(mm_state_dict: dict[str, Tensor]) -> bool:
     # check if conv_in.weight and .bias are present
     if "conv_in.weight" in mm_state_dict and "conv_in.bias" in mm_state_dict:
         return True
     return False
 
 
+def is_fancyvideo(mm_state_dict: dict[str, Tensor]) -> bool:
+    if 'FancyVideo' in mm_state_dict:
+        return True
+    return False
+
+
 def get_down_block_max(mm_state_dict: dict[str, Tensor]) -> int:
+    return get_block_max(mm_state_dict, "down_blocks")
+
+def get_up_block_max(mm_state_dict: dict[str, Tensor]) -> int:
+    return get_block_max(mm_state_dict, "up_blocks")
+
+def get_block_max(mm_state_dict: dict[str, Tensor], block_name: str) -> int:
     # keep track of biggest down_block count in module
-    biggest_block = 0
+    biggest_block = -1
     for key in mm_state_dict.keys():
-        if "down_blocks" in key:
+        if block_name in key:
             try:
                 block_int = key.split(".")[1]
                 block_num = int(block_int)
@@ -155,13 +122,23 @@ def get_down_block_max(mm_state_dict: dict[str, Tensor]) -> int:
                 pass
     return biggest_block
 
-
 def has_mid_block(mm_state_dict: dict[str, Tensor]):
     # check if keys contain mid_block
     for key in mm_state_dict.keys():
         if key.startswith("mid_block."):
             return True
     return False
+
+_regex_attention_blocks_num = re.compile(r'\.attention_blocks\.(\d+)\.')
+def get_attention_block_max_len(mm_state_dict: dict[str, Tensor]):
+    biggest_attention = -1
+    for key in mm_state_dict.keys():
+        found = _regex_attention_blocks_num.search(key)
+        if found:
+            attention_num = int(found.group(1))
+            if attention_num > biggest_attention:
+                biggest_attention = attention_num
+    return biggest_attention + 1
 
 
 def get_position_encoding_max_len(mm_state_dict: dict[str, Tensor], mm_name: str, mm_format: str) -> Union[int, None]:
@@ -183,9 +160,31 @@ def find_hotshot_module_num(key: str) -> Union[int, None]:
     return None
 
 
+_regex_hellomeme_module_num = re.compile(r'motion_modules\.(\d+)\.')
+def find_hellomeme_module_num(key: str) -> Union[int, None]:
+    found = _regex_hellomeme_module_num.search(key)
+    if found:
+        return int(found.group(1))
+    return None
+
+
 def has_img_encoder(mm_state_dict: dict[str, Tensor]):
     for key in mm_state_dict.keys():
         if key.startswith("img_encoder."):
+            return True
+    return False
+
+
+def has_fps_embedding(mm_state_dict: dict[str, Tensor]):
+    for key in mm_state_dict.keys():
+        if key.startswith("fps_embedding."):
+            return True
+    return False
+
+
+def has_motion_embedding(mm_state_dict: dict[str, Tensor]):
+    for key in mm_state_dict.keys():
+        if key.startswith("motion_embedding."):
             return True
     return False
 
@@ -195,7 +194,16 @@ def normalize_ad_state_dict(mm_state_dict: dict[str, Tensor], mm_name: str) -> T
     # log_name = mm_name.split('\\')[-1]
     # with open(Path(__file__).parent.parent.parent / rf"keys_{log_name}.txt", "w") as afile:
     #     for key, value in mm_state_dict.items():
-    #         afile.write(f"{key}:\t{value.shape}\n")
+    #         if key == 'module':
+    #             for inkey, invalue in value.items():
+    #                 if hasattr(invalue, 'shape'):
+    #                     afile.write(f"{inkey}:\t{invalue.shape}\n")
+    #                 else:
+    #                     afile.write(f"{inkey}:\t{invalue}\n")
+    #         elif hasattr(value, 'shape'):
+    #             afile.write(f"{key}:\t{value.shape}\n")
+    #         else:
+    #             afile.write(f"{key}:\t{type(value)}\n")
     # determine what SD model the motion module is intended for
     sd_type: str = None
     down_block_max = get_down_block_max(mm_state_dict)
@@ -207,12 +215,17 @@ def normalize_ad_state_dict(mm_state_dict: dict[str, Tensor], mm_name: str) -> T
         raise ValueError(f"'{mm_name}' is not a valid SD1.5 nor SDXL motion module - contained {down_block_max} downblocks.")
     # determine the model's format
     mm_format = AnimateDiffFormat.ANIMATEDIFF
+    if is_hellomeme(mm_state_dict):
+        convert_hellomeme_state_dict(mm_state_dict)
     if is_hotshotxl(mm_state_dict):
         mm_format = AnimateDiffFormat.HOTSHOTXL
     if is_animatelcm(mm_state_dict):
         mm_format = AnimateDiffFormat.ANIMATELCM
-    if is_pia(mm_state_dict):
+    if has_conv_in(mm_state_dict):
         mm_format = AnimateDiffFormat.PIA
+    if is_fancyvideo(mm_state_dict):
+        mm_format = AnimateDiffFormat.FANCYVIDEO
+        mm_state_dict.pop("FancyVideo")
     # for AnimateLCM-I2V purposes, check for img_encoder keys
     contains_img_encoder = has_img_encoder(mm_state_dict)
     # remove all non-temporal keys (in case model has extra stuff in it)
@@ -222,7 +235,10 @@ def normalize_ad_state_dict(mm_state_dict: dict[str, Tensor], mm_name: str) -> T
                 continue
             if mm_format == AnimateDiffFormat.PIA and key.startswith("conv_in."):
                 continue
+            if mm_format == AnimateDiffFormat.FANCYVIDEO and key in FancyVideoKeys:
+                continue
             del mm_state_dict[key]
+
     # determine the model's version
     mm_version = AnimateDiffVersion.V1
     if has_mid_block(mm_state_dict):
@@ -232,24 +248,62 @@ def normalize_ad_state_dict(mm_state_dict: dict[str, Tensor], mm_name: str) -> T
     info = AnimateDiffInfo(sd_type=sd_type, mm_format=mm_format, mm_version=mm_version, mm_name=mm_name)
     # convert to AnimateDiff format, if needed
     if mm_format == AnimateDiffFormat.HOTSHOTXL:
-        # HotshotXL is AD-based architecture applied to SDXL instead of SD1.5
-        # By renaming the keys, no code needs to be adapted at all
-        #
-        # reformat temporal_attentions:
-        # HSXL: temporal_attentions.#.
-        #   AD: motion_modules.#.temporal_transformer.
-        # HSXL: pos_encoder.positional_encoding
-        #   AD: pos_encoder.pe
-        for key in list(mm_state_dict.keys()):
-            module_num = find_hotshot_module_num(key)
-            if module_num is not None:
-                new_key = key.replace(f"temporal_attentions.{module_num}",
-                                      f"motion_modules.{module_num}.temporal_transformer", 1)
-                new_key = new_key.replace("pos_encoder.positional_encoding", "pos_encoder.pe")
-                mm_state_dict[new_key] = mm_state_dict[key]
-                del mm_state_dict[key]
+        convert_hotshot_state_dict(mm_state_dict)
     # return adjusted mm_state_dict and info
     return mm_state_dict, info
+
+
+def convert_hotshot_state_dict(mm_state_dict: dict[str, Tensor]):
+    # HotshotXL is AD-based architecture applied to SDXL instead of SD1.5
+    # By renaming the keys, no code needs to be adapted at all
+    ################################
+    # reformat temporal_attentions:
+    # HSXL: temporal_attentions.#.
+    #   AD: motion_modules.#.temporal_transformer.
+    # HSXL: pos_encoder.positional_encoding
+    #   AD: pos_encoder.pe
+    for key in list(mm_state_dict.keys()):
+        module_num = find_hotshot_module_num(key)
+        if module_num is not None:
+            new_key = key.replace(f"temporal_attentions.{module_num}",
+                                    f"motion_modules.{module_num}.temporal_transformer", 1)
+            new_key = new_key.replace("pos_encoder.positional_encoding", "pos_encoder.pe")
+            mm_state_dict[new_key] = mm_state_dict[key]
+            del mm_state_dict[key]
+
+
+def convert_hellomeme_state_dict(mm_state_dict: dict[str, Tensor]):
+    # HelloMeme is AD-based architecture
+    for key in list(mm_state_dict.keys()):
+        module_num = find_hellomeme_module_num(key)
+        if module_num is not None:
+            # first, add temporal_transformer everywhere as suffix after motion_modules.#.
+            new_key = key.replace(f"motion_modules.{module_num}",
+                                  f"motion_modules.{module_num}.temporal_transformer")
+            if "pos_embed" in new_key:
+                new_key1 = new_key.replace("pos_embed.pe", "attention_blocks.0.pos_encoder.pe")
+                new_key2 = new_key.replace("pos_embed.pe", "attention_blocks.1.pos_encoder.pe")
+                mm_state_dict[new_key1] = mm_state_dict[key].clone()
+                mm_state_dict[new_key2] = mm_state_dict[key].clone()
+            else:
+                if "attn1" in new_key:
+                    new_key = new_key.replace("attn1.", "attention_blocks.0.")
+                elif "attn2" in new_key:
+                    new_key = new_key.replace("attn2.", "attention_blocks.1.")
+                elif "norm1" in new_key:
+                    new_key = new_key.replace("norm1.", "norms.0.")
+                elif "norm2" in new_key:
+                    new_key = new_key.replace("norm2.", "norms.1.")
+                elif "norm3" in new_key:
+                    new_key = new_key.replace("norm3.", "ff_norm.")
+                mm_state_dict[new_key] = mm_state_dict[key]
+            del mm_state_dict[key]
+
+
+class InitKwargs:
+    OPS = "ops"
+    GET_UNET_FUNC = "get_unet_func"
+    ATTN_BLOCK_TYPE = "attn_block_type"
 
 
 class BlockType:
@@ -258,37 +312,53 @@ class BlockType:
     MID = "mid"
 
 
+def get_unet_default(wrapper: 'AnimateDiffModel', model: ModelPatcher):
+    return model.model.diffusion_model
+
+
 class AnimateDiffModel(nn.Module):
-    def __init__(self, mm_state_dict: dict[str, Tensor], mm_info: AnimateDiffInfo):
+    def __init__(self, mm_state_dict: dict[str, Tensor], mm_info: AnimateDiffInfo, init_kwargs: dict[str]={}):
         super().__init__()
         self.mm_info = mm_info
-        self.down_blocks: Iterable[MotionModule] = nn.ModuleList([])
-        self.up_blocks: Iterable[MotionModule] = nn.ModuleList([])
+        self.down_blocks: list[MotionModule] = None
+        self.up_blocks: list[MotionModule] = None
         self.mid_block: Union[MotionModule, None] = None
         self.encoding_max_len = get_position_encoding_max_len(mm_state_dict, mm_info.mm_name, mm_info.mm_format)
         self.has_position_encoding = self.encoding_max_len is not None
+        self.attn_len = get_attention_block_max_len(mm_state_dict)
+        self.attn_type = init_kwargs.get(InitKwargs.ATTN_BLOCK_TYPE, "Temporal_Self")
+        self.attn_block_types = tuple([self.attn_type] * self.attn_len)
         # determine ops to use (to support fp8 properly)
-        if comfy.model_management.unet_manual_cast(comfy.model_management.unet_dtype(), comfy.model_management.get_torch_device()) is None:
-            ops = comfy.ops.disable_weight_init
-        else:
-            ops = comfy.ops.manual_cast
-        self.ops = ops
+        self.ops = init_kwargs.get(InitKwargs.OPS, None)
+        if self.ops is None:
+            if comfy.model_management.unet_manual_cast(comfy.model_management.unet_dtype(), comfy.model_management.get_torch_device()) is None:
+                self.ops = comfy.ops.disable_weight_init
+            else:
+                self.ops = comfy.ops.manual_cast
         # SDXL has 3 up/down blocks, SD1.5 has 4 up/down blocks
         if mm_info.sd_type == ModelTypeSD.SDXL:
             layer_channels = (320, 640, 1280)
         else:
             layer_channels = (320, 640, 1280, 1280)
         self.layer_channels = layer_channels
+        self.middle_channel = 1280
         # fill out down/up blocks and middle block, if present
-        for idx, c in enumerate(layer_channels):
-            self.down_blocks.append(MotionModule(c, temporal_pe=self.has_position_encoding,
-                                                 temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.DOWN, block_idx=idx, ops=ops))
-        for idx, c in enumerate(list(reversed(layer_channels))):
-            self.up_blocks.append(MotionModule(c, temporal_pe=self.has_position_encoding,
-                                               temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.UP, block_idx=idx, ops=ops))
+        if get_down_block_max(mm_state_dict) > -1:
+            self.down_blocks = nn.ModuleList([])
+            for idx, c in enumerate(layer_channels):
+                self.down_blocks.append(MotionModule(c, temporal_pe=self.has_position_encoding,
+                                                    temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.DOWN, block_idx=idx,
+                                                    attention_block_types=self.attn_block_types, ops=self.ops))
+        if get_up_block_max(mm_state_dict) > -1:
+            self.up_blocks = nn.ModuleList([])
+            for idx, c in enumerate(list(reversed(layer_channels))):
+                self.up_blocks.append(MotionModule(c, temporal_pe=self.has_position_encoding,
+                                                temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.UP, block_idx=idx,
+                                                attention_block_types=self.attn_block_types, ops=self.ops))
         if has_mid_block(mm_state_dict):
-            self.mid_block = MotionModule(1280, temporal_pe=self.has_position_encoding,
-                                          temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.MID, ops=ops)
+            self.mid_block = MotionModule(self.middle_channel, temporal_pe=self.has_position_encoding,
+                                          temporal_pe_max_len=self.encoding_max_len, block_type=BlockType.MID,
+                                          attention_block_types=self.attn_block_types, ops=self.ops)
         self.AD_video_length: int = 24
         self.effect_model = 1.0
         self.effect_per_block_list = None
@@ -297,25 +367,36 @@ class AnimateDiffModel(nn.Module):
         if has_img_encoder(mm_state_dict):
             self.init_img_encoder()
         # CameraCtrl stuff
-        self.camera_encoder: 'CameraPoseEncoder' = None
-        # PIA stuff - create conv_in if keys are present for it
+        self.camera_encoder: CameraPoseEncoder = None
+        # PIA/FancyVideo stuff - create conv_in if keys are present for it
         self.conv_in: comfy.ops.disable_weight_init.Conv2d = None
         self.orig_conv_in: comfy.ops.disable_weight_init.Conv2d = None
-        if is_pia(mm_state_dict):
+        if has_conv_in(mm_state_dict):
             self.init_conv_in(mm_state_dict)
+        # FancyVideo fps_embedding and motion_embedding
+        self.fps_embedding: FancyVideoCondEmbedding = None
+        self.motion_embedding: FancyVideoCondEmbedding = None
+        if has_fps_embedding(mm_state_dict):
+            self.init_fps_embedding(mm_state_dict)
+        if has_motion_embedding(mm_state_dict):
+            self.init_motion_embedding(mm_state_dict)
+        # get_unet_func initialization
+        self.get_unet_func = init_kwargs.get(InitKwargs.GET_UNET_FUNC, get_unet_default)
+
+    def needs_apply_model_wrapper(self):
+        '''Returns true of AnimateLCM-I2V, CameraCtrl, or MotionCtrl is in use.'''
+        return self.img_encoder is not None or self.camera_encoder is not None or self.is_motionctrl_cc_enabled()
 
     def init_img_encoder(self):
         del self.img_encoder
         self.img_encoder = AdapterEmbed(cin=4, channels=self.layer_channels, nums_rb=2, ksize=1, sk=True, use_conv=False, ops=self.ops)
 
-    def set_camera_encoder(self, camera_encoder: 'CameraPoseEncoder'):
+    def set_camera_encoder(self, camera_encoder: CameraPoseEncoder):
         del self.camera_encoder
         self.camera_encoder = camera_encoder
 
     def init_conv_in(self, mm_state_dict: dict[str, Tensor]):
-        '''
-        Used for PIA
-        '''
+        '''Used for PIA/FancyVideo'''
         del self.conv_in
         # hardcoded values, for now
         # dim=2, in_channels=9, model_channels=320, kernel=3, padding=1,
@@ -325,6 +406,67 @@ class AnimateDiffModel(nn.Module):
         # create conv_in with proper params
         self.conv_in = self.ops.conv_nd(2, in_channels, model_channels, 3, padding=1,
                                         dtype=comfy.model_management.unet_dtype(), device=comfy.model_management.unet_offload_device())
+
+    def init_fps_embedding(self, mm_state_dict: dict[str, Tensor]):
+        '''Used for FancyVideo'''
+        del self.fps_embedding
+        in_channels = mm_state_dict["fps_embedding.linear.weight"].size(1) # expected to be 320
+        cond_embed_dim = mm_state_dict["fps_embedding.linear.weight"].size(0) # expected to be 1280
+        self.fps_embedding = FancyVideoCondEmbedding(in_channels=in_channels, cond_embed_dim=cond_embed_dim)
+        self.fps_embedding.apply(initialize_weights_to_zero)
+
+    def init_motion_embedding(self, mm_state_dict: dict[str, Tensor]):
+        '''Used for FancyVideo'''
+        del self.motion_embedding
+        in_channels = mm_state_dict["motion_embedding.linear.weight"].size(1) # expected to be 320
+        cond_embed_dim = mm_state_dict["motion_embedding.linear.weight"].size(0) # expected to be 1280
+        self.motion_embedding = FancyVideoCondEmbedding(in_channels=in_channels, cond_embed_dim=cond_embed_dim)
+        self.motion_embedding.apply(initialize_weights_to_zero)
+
+    def init_motionctrl_cc_projections(self, state_dict: dict[str, Tensor]):
+        '''Used for MotionCtrl'''
+        for key, value in state_dict.items():
+            if key.endswith('cc_projection.weight'):
+                in_features = value.shape[1]
+                out_features = value.shape[0]
+                ttb_key = key.split('.cc_projection')[0]
+                ttb: TemporalTransformerBlock = comfy.utils.get_attr(self, ttb_key)
+                ttb.init_cc_projection(in_features=in_features, out_features=out_features, ops=self.ops)
+
+    def is_motionctrl_cc_enabled(self):
+        '''Used for MotionCtrl'''
+        if self.down_blocks:
+            ttb: TemporalTransformerBlock = self.down_blocks[0].motion_modules[0].temporal_transformer.transformer_blocks[0]
+            return ttb.cc_projection is not None
+        return False
+
+    def get_fancyvideo_emb_patches(self, dtype, device, fps=25, motion_score=3.0):
+        patches = []
+        if self.fps_embedding is not None:
+            if fps is not None:
+                def fps_emb_patch(emb: Tensor, model_channels: int, transformer_options: dict[str]):
+                    nonlocal fps
+                    if fps is None:
+                        return emb
+                    fps = torch.tensor(fps).to(dtype=emb.dtype, device=emb.device)
+                    fps = fps.expand(emb.shape[0])
+                    fps_emb = timestep_embedding(fps, model_channels, repeat_only=False).to(dtype=emb.dtype)
+                    fps_emb = self.fps_embedding(fps_emb)
+                    return emb + fps_emb
+                patches.append(fps_emb_patch)
+        if self.motion_embedding is not None:
+            if motion_score is not None:
+                def motion_emb_patch(emb: Tensor, model_channels: int, transformer_options: dict[str]):
+                    nonlocal motion_score
+                    if motion_score is None:
+                        return emb
+                    motion_score = torch.tensor(motion_score).to(dtype=emb.dtype, device=emb.device)
+                    motion_score = motion_score.expand(emb.shape[0])
+                    motion_emb = timestep_embedding(motion_score, model_channels, repeat_only=False).to(dtype=emb.dtype)
+                    motion_emb = self.motion_embedding(motion_emb)
+                    return emb + motion_emb
+                patches.append(motion_emb_patch)
+        return patches
 
     def get_device_debug(self):
         return self.down_blocks[0].motion_modules[0].temporal_transformer.proj_in.weight.device
@@ -361,7 +503,7 @@ class AnimateDiffModel(nn.Module):
             self.img_encoder.cleanup()
 
     def inject(self, model: ModelPatcher):
-        unet: openaimodel.UNetModel = model.model.diffusion_model
+        unet: openaimodel.UNetModel = self.get_unet_func(self, model)
         # inject input (down) blocks
         # SD15 mm contains 4 downblocks, each with 2 TemporalTransformers - 8 in total
         # SDXL mm contains 3 downblocks, each with 2 TemporalTransformers - 6 in total
@@ -415,13 +557,16 @@ class AnimateDiffModel(nn.Module):
             unet_idx += 1
 
     def eject(self, model: ModelPatcher):
-        unet: openaimodel.UNetModel = model.model.diffusion_model
+        unet: openaimodel.UNetModel = self.get_unet_func(self, model)
         # remove from input blocks (downblocks)
-        self._eject(unet.input_blocks)
+        if hasattr(unet, "input_blocks"):
+            self._eject(unet.input_blocks)
         # remove from output blocks (upblocks)
-        self._eject(unet.output_blocks)
+        if hasattr(unet, "output_blocks"):
+            self._eject(unet.output_blocks)
         # remove from middle block (encapsulate in list to make compatible)
-        self._eject([unet.middle_block])
+        if hasattr(unet, "middle_block"):
+            self._eject([unet.middle_block])
         del unet
 
     def _eject(self, unet_blocks: nn.ModuleList):
@@ -435,7 +580,7 @@ class AnimateDiffModel(nn.Module):
             for idx in sorted(idx_to_pop, reverse=True):
                 block.pop(idx)
 
-    def inject_unet_conv_in_pia(self, model: BaseModel):
+    def inject_unet_conv_in_pia_fancyvideo(self, model: BaseModel):
         if self.conv_in is None:
             return
         # TODO: make sure works with lowvram
@@ -459,7 +604,7 @@ class AnimateDiffModel(nn.Module):
         # now can apply combined_conv_in to unet block
         model.diffusion_model.input_blocks[0][0] = combined_conv_in
     
-    def restore_unet_conv_in_pia(self, model: BaseModel):
+    def restore_unet_conv_in_pia_fancyvideo(self, model: BaseModel):
         if self.orig_conv_in is not None:
             model.diffusion_model.input_blocks[0][0] = self.orig_conv_in.to(model.diffusion_model.input_blocks[0][0].weight.device)
             self.orig_conv_in = None
@@ -575,23 +720,24 @@ class MotionModule(nn.Module):
             temporal_pe_max_len=24,
             block_type: str=BlockType.DOWN,
             block_idx: int=0,
+            attention_block_types=("Temporal_Self", "Temporal_Self"),
             ops=comfy.ops.disable_weight_init
         ):
         super().__init__()
         if block_type == BlockType.MID:
             # mid blocks contain only a single VanillaTemporalModule
-            self.motion_modules: Iterable[VanillaTemporalModule] = nn.ModuleList([get_motion_module(in_channels, block_type, block_idx, module_idx=0, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops)])
+            self.motion_modules: list[VanillaTemporalModule] = nn.ModuleList([get_motion_module(in_channels, block_type, block_idx, module_idx=0, attention_block_types=attention_block_types, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops)])
         else:
             # down blocks contain two VanillaTemporalModules
-            self.motion_modules: Iterable[VanillaTemporalModule] = nn.ModuleList(
+            self.motion_modules: list[VanillaTemporalModule] = nn.ModuleList(
                 [
-                    get_motion_module(in_channels, block_type, block_idx, module_idx=0, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops),
-                    get_motion_module(in_channels, block_type, block_idx, module_idx=1, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops)
+                    get_motion_module(in_channels, block_type, block_idx, module_idx=0, attention_block_types=attention_block_types, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops),
+                    get_motion_module(in_channels, block_type, block_idx, module_idx=1, attention_block_types=attention_block_types, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops)
                 ]
             )
             # up blocks contain one additional VanillaTemporalModule
             if block_type == BlockType.UP: 
-                self.motion_modules.append(get_motion_module(in_channels, block_type, block_idx, module_idx=2, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops))
+                self.motion_modules.append(get_motion_module(in_channels, block_type, block_idx, module_idx=2, attention_block_types=attention_block_types, temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops))
     
     def set_video_length(self, video_length: int, full_length: int):
         for motion_module in self.motion_modules:
@@ -632,8 +778,10 @@ class MotionModule(nn.Module):
 
 
 def get_motion_module(in_channels, block_type: str, block_idx: int, module_idx: int,
+                      attention_block_types: list[str],
                       temporal_pe, temporal_pe_max_len, ops=comfy.ops.disable_weight_init):
     return VanillaTemporalModule(in_channels=in_channels, block_type=block_type, block_idx=block_idx, module_idx=module_idx,
+                                 attention_block_types=attention_block_types,
                                  temporal_pe=temporal_pe, temporal_pe_max_len=temporal_pe_max_len, ops=ops)
 
 
@@ -781,7 +929,7 @@ class VanillaTemporalModule(nn.Module):
     def should_handle_camera_features(self):
         return self.camera_features is not None and self.block_type != BlockType.MID# and self.module_idx == 0
 
-    def forward(self, input_tensor: Tensor, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, input_tensor: Tensor, encoder_hidden_states=None, attention_mask=None, transformer_options=None):
         #logger.info(f"block_type: {self.block_type}, block_idx: {self.block_idx}, module_idx: {self.module_idx}")
         mm_kwargs = None
         if self.should_handle_camera_features():
@@ -790,7 +938,7 @@ class VanillaTemporalModule(nn.Module):
             # do AnimateLCM-I2V stuff if needed
             if self.should_handle_img_features():
                 input_tensor += self.img_features[self.block_idx]
-            return self.temporal_transformer(input_tensor, encoder_hidden_states, attention_mask, self.view_options, mm_kwargs)
+            return self.temporal_transformer(input_tensor, encoder_hidden_states, attention_mask, self.view_options, mm_kwargs, transformer_options)
         # return weighted average of input_tensor and AD output
         if type(self.effect) != Tensor:
             effect = self.effect
@@ -804,8 +952,8 @@ class VanillaTemporalModule(nn.Module):
             effect = self.get_effect_mask(input_tensor)
         # do AnimateLCM-I2V stuff if needed
         if self.should_handle_img_features():
-            return input_tensor*(1.0-effect) + self.temporal_transformer(input_tensor+self.img_features[self.block_idx], encoder_hidden_states, attention_mask, self.view_options, mm_kwargs)*effect
-        return input_tensor*(1.0-effect) + self.temporal_transformer(input_tensor, encoder_hidden_states, attention_mask, self.view_options, mm_kwargs)*effect
+            return input_tensor*(1.0-effect) + self.temporal_transformer(input_tensor+self.img_features[self.block_idx], encoder_hidden_states, attention_mask, self.view_options, mm_kwargs, transformer_options)*effect
+        return input_tensor*(1.0-effect) + self.temporal_transformer(input_tensor, encoder_hidden_states, attention_mask, self.view_options, mm_kwargs, transformer_options)*effect
 
 
 class TemporalTransformer3DModel(nn.Module):
@@ -964,7 +1112,7 @@ class TemporalTransformer3DModel(nn.Module):
         # otherwise, calculate temp mask
         self.prev_hidden_states_batch = batch
         mask = prepare_mask_batch(self.raw_scale_masks[idx], shape=(self.full_length, 1, height, width))
-        mask = repeat_to_batch_size(mask, self.full_length)
+        mask = extend_to_batch_size(mask, self.full_length)
         # if mask not the same amount length as full length, make it match
         if self.full_length != mask.shape[0]:
             mask = broadcast_image_to(mask, self.full_length, 1)
@@ -1010,7 +1158,7 @@ class TemporalTransformer3DModel(nn.Module):
         # otherwise, calculate temp_cameractrl
         self.prev_cameractrl_hidden_states_batch = batch
         mask = prepare_mask_batch(self.raw_cameractrl_effect, shape=(self.full_length, 1, height, width))
-        mask = repeat_to_batch_size(mask, self.full_length)
+        mask = extend_to_batch_size(mask, self.full_length)
         # if mask not the same amount length as full length, make it match
         if self.full_length != mask.shape[0]:
             mask = broadcast_image_to(mask, self.full_length, 1)
@@ -1034,7 +1182,7 @@ class TemporalTransformer3DModel(nn.Module):
             return self.temp_cameractrl_effect[:, self.sub_idxs, :]
         return self.temp_cameractrl_effect
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, view_options: ContextOptions=None, mm_kwargs: dict[str]=None):
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, view_options: ContextOptions=None, mm_kwargs: dict[str]=None, transformer_options=None):
         batch, channel, height, width = hidden_states.shape
         residual = hidden_states
         scale_masks = self.get_scale_masks(hidden_states)
@@ -1057,7 +1205,8 @@ class TemporalTransformer3DModel(nn.Module):
                 scale_masks=scale_masks,
                 cameractrl_effect=cameractrl_effect,
                 view_options=view_options,
-                mm_kwargs=mm_kwargs
+                mm_kwargs=mm_kwargs,
+                transformer_options=transformer_options,
             )
 
         # output
@@ -1126,6 +1275,8 @@ class TemporalTransformerBlock(nn.Module):
 
         self.ff = FeedForward(dim, dropout=dropout, glu=(activation_fn == "geglu"), operations=ops)
         self.ff_norm = ops.LayerNorm(dim)
+        # for MotionCtrl (CMCM) use
+        self.cc_projection: comfy.ops.disable_weight_init.Linear = None
 
     def set_scale_multiplier(self, idx: int, multiplier: Union[float, None]):
         self.attention_blocks[idx].set_scale_multiplier(multiplier)
@@ -1138,6 +1289,9 @@ class TemporalTransformerBlock(nn.Module):
         for block in self.attention_blocks:
             block.reset_temp_vars()
 
+    def init_cc_projection(self, in_features: int, out_features: int, ops: comfy.ops.disable_weight_init):
+        self.cc_projection = ops.Linear(in_features=in_features, out_features=out_features)
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -1148,6 +1302,7 @@ class TemporalTransformerBlock(nn.Module):
         cameractrl_effect: Union[float, Tensor] = None,
         view_options: Union[ContextOptions, None]=None,
         mm_kwargs: dict[str]=None,
+        transformer_options: dict[str]=None,
     ):
         if scale_masks is None:
             scale_masks = [None] * len(self.attention_blocks)
@@ -1158,6 +1313,7 @@ class TemporalTransformerBlock(nn.Module):
             elif view_options.context_length == video_length and not view_options.use_on_equal_length:
                 view_options = None
         if not view_options:
+            count = 0
             for attention_block, norm, scale_mask in zip(self.attention_blocks, self.norms, scale_masks):
                 norm_hidden_states = norm(hidden_states).to(hidden_states.dtype)
                 hidden_states = (
@@ -1170,9 +1326,19 @@ class TemporalTransformerBlock(nn.Module):
                         video_length=video_length,
                         scale_mask=scale_mask,
                         cameractrl_effect=cameractrl_effect,
-                        mm_kwargs=mm_kwargs
+                        mm_kwargs=mm_kwargs,
+                        transformer_options=transformer_options,
                     ) + hidden_states
                 )
+                # do MotionCtrl-CMCM stuff if needed
+                if self.cc_projection is not None and count==0 and 'ADE_RT' in transformer_options:
+                    RT: Tensor = transformer_options['ADE_RT'].to(dtype=hidden_states.dtype)
+                    B, t, _ = RT.shape
+                    RT = RT.reshape(B*t, 1, -1)
+                    RT = RT.repeat(1, hidden_states.shape[1], 1)
+                    hidden_states = torch.cat([hidden_states, RT], dim=-1)
+                    hidden_states = self.cc_projection(hidden_states).to(dtype=hidden_states.dtype)
+                count += 1
         else:
             # views idea gotten from diffusers AnimateDiff FreeNoise implementation:
             # https://github.com/arthur-qiu/FreeNoise-AnimateDiff/blob/main/animatediff/models/motion_module.py
@@ -1181,7 +1347,6 @@ class TemporalTransformerBlock(nn.Module):
             hidden_states = rearrange(hidden_states, "(b f) d c -> b f d c", f=video_length)
             value_final = torch.zeros_like(hidden_states)
             count_final = torch.zeros_like(hidden_states)
-            # bias_final = [0.0] * video_length
             batched_conds = hidden_states.size(1) // video_length
             # store original camera_feature, if present
             has_camera_feature = False
@@ -1193,6 +1358,7 @@ class TemporalTransformerBlock(nn.Module):
                 sub_hidden_states = rearrange(hidden_states[:, sub_idxs], "b f d c -> (b f) d c")
                 if has_camera_feature:
                     mm_kwargs["camera_feature"] = orig_camera_feature[:, sub_idxs, :]
+                count = 0
                 for attention_block, norm, scale_mask in zip(self.attention_blocks, self.norms, scale_masks):
                     norm_hidden_states = norm(sub_hidden_states).to(sub_hidden_states.dtype)
                     sub_hidden_states = (
@@ -1205,28 +1371,13 @@ class TemporalTransformerBlock(nn.Module):
                             video_length=len(sub_idxs),
                             scale_mask=scale_mask[:, sub_idxs, :] if scale_mask is not None else scale_mask,
                             cameractrl_effect=cameractrl_effect[:, sub_idxs, :] if type(cameractrl_effect) == Tensor else cameractrl_effect,
-                            mm_kwargs=mm_kwargs
+                            mm_kwargs=mm_kwargs,
+                            transformer_options=transformer_options,
                         ) + sub_hidden_states
                     )
+                    count += 1
                 sub_hidden_states = rearrange(sub_hidden_states, "(b f) d c -> b f d c", f=len(sub_idxs))
 
-                # if view_options.fuse_method == ContextFuseMethod.RELATIVE:
-                #     for pos, idx in enumerate(sub_idxs):
-                #         # bias is the influence of a specific index in relation to the whole context window
-                #         bias = 1 - abs(idx - (sub_idxs[0] + sub_idxs[-1]) / 2) / ((sub_idxs[-1] - sub_idxs[0] + 1e-2) / 2)
-                #         bias = max(1e-2, bias)
-                #         # take weighted averate relative to total bias of current idx
-                #         bias_total = bias_final[idx]
-                #         prev_weight = torch.tensor([bias_total / (bias_total + bias)],
-                #                                    dtype=value_final.dtype, device=value_final.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                #         #prev_weight = torch.cat([prev_weight]*value_final.shape[1], dim=1)
-                #         new_weight = torch.tensor([bias / (bias_total + bias)],
-                #                                    dtype=value_final.dtype, device=value_final.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                #         #new_weight = torch.cat([new_weight]*value_final.shape[1], dim=1)
-                #         test = value_final[:, idx:idx+1, :, :]
-                #         value_final[:, idx:idx+1, :, :] = value_final[:, idx:idx+1, :, :] * prev_weight + sub_hidden_states[:, pos:pos+1, : ,:] * new_weight
-                #         bias_final[idx] = bias_total + bias
-                # else:
                 weights = get_context_weights(len(sub_idxs), view_options.fuse_method) * batched_conds
                 weights_tensor = torch.Tensor(weights).to(device=hidden_states.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
                 value_final[:, sub_idxs] += sub_hidden_states * weights_tensor
@@ -1235,18 +1386,13 @@ class TemporalTransformerBlock(nn.Module):
             if has_camera_feature:
                 mm_kwargs["camera_feature"] = orig_camera_feature
                 del orig_camera_feature
-            # get weighted average of sub_hidden_states, if fuse method requires it
-            # if view_options.fuse_method != ContextFuseMethod.RELATIVE:
+            # get weighted average of sub_hidden_states
             hidden_states = value_final / count_final
             hidden_states = rearrange(hidden_states, "b f d c -> (b f) d c")
             del value_final
             del count_final
-            # del bias_final
 
-        hidden_states = self.ff(self.ff_norm(hidden_states)) + hidden_states
-
-        output = hidden_states
-        return output
+        return self.ff(self.ff_norm(hidden_states)) + hidden_states
 
 
 class PositionalEncoding(nn.Module):
@@ -1267,7 +1413,7 @@ class PositionalEncoding(nn.Module):
     def set_sub_idxs(self, sub_idxs: list[int]):
         self.sub_idxs = sub_idxs
 
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, mm_kwargs: dict[str]={}, transformer_options: dict[str]=None):
         #if self.sub_idxs is not None:
         #    x = x + self.pe[:, self.sub_idxs]
         #else:
@@ -1288,7 +1434,6 @@ class VersatileAttention(CrossAttentionMM):
     ):
         super().__init__(operations=ops, *args, **kwargs)
         assert attention_mode == "Temporal"
-
         self.attention_mode = attention_mode
         self.is_cross_attention = kwargs["context_dim"] is not None
 
@@ -1334,6 +1479,7 @@ class VersatileAttention(CrossAttentionMM):
         scale_mask=None,
         cameractrl_effect: Union[float, Tensor] = 1.0,
         mm_kwargs: dict[str]={},
+        transformer_options: dict[str]=None,
     ):
         if self.attention_mode != "Temporal":
             raise NotImplementedError
@@ -1344,7 +1490,7 @@ class VersatileAttention(CrossAttentionMM):
         )
 
         if self.pos_encoder is not None:
-           hidden_states = self.pos_encoder(hidden_states).to(hidden_states.dtype)
+           hidden_states = self.pos_encoder(hidden_states, mm_kwargs, transformer_options).to(hidden_states.dtype)
 
         encoder_hidden_states = (
             repeat(encoder_hidden_states, "b n c -> (b d) n c", d=d)
@@ -1362,11 +1508,12 @@ class VersatileAttention(CrossAttentionMM):
             value=None,
             mask=attention_mask,
             scale_mask=scale_mask,
+            mm_kwargs=mm_kwargs,
+            transformer_options=transformer_options,
         )
 
-        hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+        return rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
 
-        return hidden_states
 
 ############################################################################
 ### EncoderOnly Version
@@ -1374,7 +1521,7 @@ class VersatileAttention(CrossAttentionMM):
 class EncoderOnlyAnimateDiffModel(AnimateDiffModel):
     def __init__(self, mm_state_dict: dict[str, Tensor], mm_info: AnimateDiffInfo):
         super().__init__(mm_state_dict=mm_state_dict, mm_info=mm_info)
-        self.down_blocks: Iterable[EncoderOnlyMotionModule] = nn.ModuleList([])
+        self.down_blocks: list[EncoderOnlyMotionModule] = nn.ModuleList([])
         self.up_blocks = None
         self.mid_block = None
         # fill out down/up blocks and middle block, if present
@@ -1441,7 +1588,7 @@ class EncoderOnlyTemporalModule(VanillaTemporalModule):
     def create(cls, in_channels, block_type: str, block_idx: int, module_idx: int, ops=comfy.ops.disable_weight_init):
         return cls(in_channels=in_channels, block_type=block_type, block_idx=block_idx, module_idx=module_idx, ops=ops)
 
-    def forward(self, input_tensor: Tensor, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, input_tensor: Tensor, encoder_hidden_states=None, attention_mask=None, transformer_options=None):
         if self.effect is None:
             # do AnimateLCM-I2V stuff if needed
             if self.should_handle_img_features():

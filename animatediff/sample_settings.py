@@ -1,19 +1,23 @@
+from __future__ import annotations
 from collections.abc import Iterable
 from typing import Union, Callable
 import torch
 from torch import Tensor
+import torch.fft as fft
+from einops import rearrange
 
+import comfy.k_diffusion.sampling
 import comfy.sample
 import comfy.samplers
 import comfy.model_management
+from comfy.patcher_extension import WrappersMP, add_wrapper_with_key
 from comfy.model_patcher import ModelPatcher
 from comfy.model_base import BaseModel
 from comfy.sd import VAE
 
 from . import freeinit
-from .conditioning import LoraHookMode
 from .context import ContextOptions, ContextOptionsGroup
-from .utils_model import SigmaSchedule
+from .utils_model import SigmaSchedule, BIGMAX_TENSOR
 from .utils_motion import extend_to_batch_size, get_sorted_list_via_attr, prepare_mask_batch
 from .logger import logger
 
@@ -28,6 +32,13 @@ def prepare_mask_ad(noise_mask, shape, device):
     return noise_mask
 
 
+class NoiseDeterminism:
+    DEFAULT = "default"
+    DETERMINISTIC = "deterministic"
+
+    _LIST = [DEFAULT, DETERMINISTIC]
+
+
 class NoiseLayerType:
     DEFAULT = "default"
     CONSTANT = "constant"
@@ -36,14 +47,16 @@ class NoiseLayerType:
     FREENOISE = "FreeNoise"
 
     LIST = [DEFAULT, CONSTANT, EMPTY, REPEATED_CONTEXT, FREENOISE]
+    LIST_ANCESTRAL = [DEFAULT, CONSTANT]
 
 
 class NoiseApplication:
     ADD = "add"
     ADD_WEIGHTED = "add_weighted"
+    NORMALIZED_SUM = "normalized_sum"
     REPLACE = "replace"
     
-    LIST = [ADD, ADD_WEIGHTED, REPLACE]
+    LIST = [ADD, ADD_WEIGHTED, NORMALIZED_SUM, REPLACE]
 
 
 class NoiseNormalize:
@@ -54,9 +67,10 @@ class NoiseNormalize:
 
 
 class SampleSettings:
-    def __init__(self, batch_offset: int=0, noise_type: str=None, seed_gen: str=None, seed_offset: int=0, noise_layers: 'NoiseLayerGroup'=None,
+    def __init__(self, batch_offset: int=0, noise_type: str=None, seed_gen: str=None, seed_offset: int=0, noise_layers: NoiseLayerGroup=None,
                  iteration_opts=None, seed_override:int=None, negative_cond_flipflop=False, adapt_denoise_steps: bool=False,
-                 custom_cfg: 'CustomCFGKeyframeGroup'=None, sigma_schedule: SigmaSchedule=None, image_injection: 'NoisedImageToInjectGroup'=None):
+                 custom_cfg: CustomCFGKeyframeGroup=None, sigma_schedule: SigmaSchedule=None, image_injection: NoisedImageToInjectGroup=None,
+                 noise_calibration: NoiseCalibration=None, ancestral_opts: AncestralOptions=None):
         self.batch_offset = batch_offset
         self.noise_type = noise_type if noise_type is not None else NoiseLayerType.DEFAULT
         self.seed_gen = seed_gen if seed_gen is not None else SeedNoiseGeneration.COMFY
@@ -69,6 +83,8 @@ class SampleSettings:
         self.custom_cfg = custom_cfg.clone() if custom_cfg else custom_cfg
         self.sigma_schedule = sigma_schedule
         self.image_injection = image_injection.clone() if image_injection else NoisedImageToInjectGroup()
+        self.noise_calibration = noise_calibration
+        self.ancestral_opts = ancestral_opts
     
     def prepare_noise(self, seed: int, latents: Tensor, noise: Tensor, extra_seed_offset=0, extra_args:dict={}, force_create_noise=True):
         if self.seed_override is not None:
@@ -109,7 +125,84 @@ class SampleSettings:
         return SampleSettings(batch_offset=self.batch_offset, noise_type=self.noise_type, seed_gen=self.seed_gen, seed_offset=self.seed_offset,
                            noise_layers=self.noise_layers.clone(), iteration_opts=self.iteration_opts, seed_override=self.seed_override,
                            negative_cond_flipflop=self.negative_cond_flipflop, adapt_denoise_steps=self.adapt_denoise_steps, custom_cfg=self.custom_cfg,
-                           sigma_schedule=self.sigma_schedule, image_injection=self.image_injection)
+                           sigma_schedule=self.sigma_schedule, image_injection=self.image_injection, noise_calibration=self.noise_calibration,
+                           ancestral_opts=self.ancestral_opts)
+
+
+class AncestralOptions:
+    def __init__(self, noise_type: str, determinism: str, seed_offset: int, seed_override: int=None):
+        self.noise_type = noise_type
+        self.determinism = determinism
+        self.seed_offset = seed_offset
+        self.seed_override = seed_override
+    
+    def init_custom_noise_sampler(self, seed: int):
+        if self.seed_override is not None:
+            seed = self.seed_override
+        if isinstance(seed, Iterable):
+            raise Exception("Passing in a list of seeds for Ancestral Options is not supported at this time.")
+        seed += self.seed_offset
+        return _custom_noise_sampler_factory(real_seed=seed, noise_type=self.noise_type, determinism=self.determinism)
+
+    def add_wrapper_sampler_sample(self, model_options, seed):
+        add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, "ADE",
+                             _sampler_sample_ancestral_options_factory(self.init_custom_noise_sampler(seed)),
+                             model_options, is_model_options=True)
+
+
+def _sampler_sample_ancestral_options_factory(custom_noise_sampler: Callable):
+    def sampler_sample_ancestral_options_wrapper(executor, *args, **kwargs):
+        try:
+            # TODO: implement this as a model_options thing instead in core ComfyUI
+            orig_default_noise_sampler = comfy.k_diffusion.sampling.default_noise_sampler
+            comfy.k_diffusion.sampling.default_noise_sampler = custom_noise_sampler
+            return executor(*args, **kwargs)
+        finally:
+            comfy.k_diffusion.sampling.default_noise_sampler = orig_default_noise_sampler
+    return sampler_sample_ancestral_options_wrapper
+
+
+def _custom_noise_sampler_factory(real_seed: int, noise_type: str, determinism: str):
+    def custom_noise_sampler(x: Tensor, seed: int=None):
+        single_generator = None
+        multiple_generators = []
+        if determinism == NoiseDeterminism.DEFAULT:
+            # prepare generators
+            single_generator = torch.Generator(device=x.device)
+            single_generator.manual_seed(real_seed)
+            # create function to handle determinism type
+            def sample_default(sigma, sigma_next):
+                if noise_type == NoiseLayerType.CONSTANT:
+                    goal_shape = list(x.shape)
+                    goal_shape[0] = 1
+                    one_noise = torch.randn(goal_shape, dtype=x.dtype, layout=x.layout, device=x.device, generator=single_generator)
+                    return torch.cat([one_noise]*x.shape[0], dim=0)
+                return torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device, generator=single_generator)
+            # return function
+            return sample_default
+        elif determinism == NoiseDeterminism.DETERMINISTIC:
+            # prepare generators
+            for i in range(x.size(0)):
+                generator = torch.Generator(device=x.device)
+                multiple_generators.append(generator.manual_seed(real_seed+i))
+            # create function to handle determinism type
+            def sample_deterministic(sigma, sigma_next):
+                goal_shape = list(x.shape)
+                goal_shape[0] = 1
+                if noise_type == NoiseLayerType.CONSTANT:
+                    one_noise = torch.randn(goal_shape, dtype=x.dtype, layout=x.layout, device=x.device, generator=multiple_generators[0])
+                    return torch.cat([one_noise]*x.shape[0], dim=0)
+                noises = []
+                for generator in multiple_generators:
+                    one_noise = torch.randn(goal_shape, dtype=x.dtype, layout=x.layout, device=x.device, generator=generator)
+                    noises.append(one_noise)
+                return torch.cat(noises, dim=0)
+            # return function
+            return sample_deterministic
+        else:
+            raise Exception(f"Determinism type '{determinism}' is not recognized.")
+    # return function
+    return custom_noise_sampler
 
 
 class NoiseLayer:
@@ -167,13 +260,33 @@ class NoiseLayerAdd(NoiseLayer):
 class NoiseLayerAddWeighted(NoiseLayerAdd):
     def __init__(self, noise_type: str, batch_offset: int, seed_gen_override: str, seed_offset: int, seed_override: int=None, mask: Tensor=None,
                  noise_weight=1.0, balance_multiplier=1.0):
-        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask, noise_weight)
+        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask)
+        self.noise_weight = noise_weight
         self.balance_multiplier = balance_multiplier
         self.application = NoiseApplication.ADD_WEIGHTED
 
     def apply_layer_noise(self, new_noise: Tensor, old_noise: Tensor) -> Tensor:
         noise_mask = self.get_noise_mask(old_noise)
         return (1-noise_mask)*old_noise + noise_mask*(old_noise * (1.0-(self.noise_weight*self.balance_multiplier)) + new_noise * self.noise_weight)
+
+
+class NoiseLayerNormalizedSum(NoiseLayer):
+    def __init__(self, noise_type: str, batch_offset: int, seed_gen_override: str, seed_offset: int, seed_override: int=None, mask: Tensor=None,
+                 noise_weight=1.0):
+        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask)
+        self.noise_weight = noise_weight
+        self.application = NoiseApplication.NORMALIZED_SUM
+
+    def apply_layer_noise(self, new_noise: Tensor, old_noise: Tensor) -> Tensor:
+        noise_mask = self.get_noise_mask(old_noise)
+        weight_old = 1.0 - self.noise_weight
+        weight_new = self.noise_weight
+        
+        norm_factor = (weight_old**2 + weight_new**2)**0.5
+        weight_old /= norm_factor
+        weight_new /= norm_factor
+
+        return (1 - noise_mask) * old_noise + noise_mask * (weight_old * old_noise + weight_new * new_noise)
 
 
 class NoiseLayerGroup:
@@ -472,7 +585,7 @@ class FreeInitOptions(IterationOptions):
             alpha_cumprod = 1 / ((sigma * sigma) + 1)
             sqrt_alpha_prod = alpha_cumprod ** 0.5
             sqrt_one_minus_alpha_prod = (1 - alpha_cumprod) ** 0.5
-            noised_latents = latents * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+            noised_latents = latents * sqrt_alpha_prod + noise.to(dtype=latents.dtype, device=latents.device) * sqrt_one_minus_alpha_prod
             # 2. create random noise z_rand for high frequency
             temp_sample_settings = sample_settings.clone()
             temp_sample_settings.batch_offset += self.iter_batch_offset * curr_i
@@ -480,7 +593,7 @@ class FreeInitOptions(IterationOptions):
             z_rand = temp_sample_settings.prepare_noise(seed=seed, latents=latents, noise=None,
                                                     extra_args=noise_extra_args, force_create_noise=True)
             # 3. noise reinitialization - combines low freq. noise from noised_latents and high freq. noise from z_rand
-            noised_latents = freeinit.freq_mix_3d(x=noised_latents, noise=z_rand.to(dtype=latents.dtype, device=latents.device), LPF=self.freq_filter)
+            noised_latents = freeinit.freq_mix_3d(x=noised_latents, noise=z_rand, LPF=self.freq_filter)
             return cached_latents, noised_latents
         elif self.init_type == self.DINKINIT_V1:
             # NOTE: This was my first attempt at implementing FreeInit; it sorta works due to my alpha_cumprod shenanigans,
@@ -488,7 +601,7 @@ class FreeInitOptions(IterationOptions):
             # 1. apply initial noise with appropriate step sigma
             sigma = self.get_sigma(model, self.step-1000).to(latents.device)
             alpha_cumprod = 1 / ((sigma * sigma) + 1) #1 / ((sigma * sigma)) # 1 / ((sigma * sigma) + 1)
-            noised_latents = (latents + (cached_noise * sigma)) * alpha_cumprod
+            noised_latents = (latents + (cached_noise.to(dtype=latents.dtype, device=latents.device) * sigma)) * alpha_cumprod
             # 2. create random noise z_rand for high frequency
             temp_sample_settings = sample_settings.clone()
             temp_sample_settings.batch_offset += self.iter_batch_offset * curr_i
@@ -497,10 +610,84 @@ class FreeInitOptions(IterationOptions):
                                                     extra_args=noise_extra_args, force_create_noise=True)
             ####z_rand = torch.randn_like(latents, dtype=latents.dtype, device=latents.device)
             # 3. noise reinitialization - combines low freq. noise from noised_latents and high freq. noise from z_rand
-            noised_latents = freeinit.freq_mix_3d(x=noised_latents, noise=z_rand.to(dtype=latents.dtype, device=latents.device), LPF=self.freq_filter)
+            noised_latents = freeinit.freq_mix_3d(x=noised_latents, noise=z_rand, LPF=self.freq_filter)
             return cached_latents, noised_latents
         else:
             raise ValueError(f"FreeInit init_type '{self.init_type}' is not recognized.")
+
+
+class NoiseCalibration:
+    def __init__(self, scale: float=0.5, calib_iterations: int=1):
+        self.scale = scale
+        self.calib_iterations = calib_iterations
+    
+    def perform_calibration(self, sample_func: Callable, model: ModelPatcher, latents: Tensor, noise: Tensor, is_custom: bool, args: list, kwargs: dict):
+        if is_custom:
+            return self._perform_calibration_custom(sample_func=sample_func, model=model, latents=latents, noise=noise, _args=args, _kwargs=kwargs)
+        return self._perform_calibration_not_custom(sample_func=sample_func, model=model, latents=latents, noise=noise, args=args, kwargs=kwargs)
+    
+    def _perform_calibration_custom(self, sample_func: Callable, model: ModelPatcher, latents: Tensor, noise: Tensor, _args: list, _kwargs: dict):
+        args = _args.copy()
+        kwargs = _kwargs.copy()
+        # need to get sigmas to be used in sampling and for noise calc
+        sigmas = args[2]
+        # use first 2 sigmas as real sigmas (2 sigmas = 1 step)
+        sigmas = sigmas[:2]
+        args[2] = sigmas
+        # divide by scale factor
+        sigma = sigmas[0] / (model.model.latent_format.scale_factor)
+        alpha_cumprod = 1 / ((sigma * sigma) + 1)
+        sqrt_alpha_prod = alpha_cumprod ** 0.5
+        sqrt_one_minus_alpha_prod = (1 - alpha_cumprod) ** 0.5
+        zero_noise = torch.zeros_like(noise)
+        new_latents = latents# / (model.model.latent_format.scale_factor)
+        #new_latents = latents * (model.model.latent_format.scale_factor)
+        for _ in range(self.calib_iterations):
+            # TODO: do i need to use DDIM noising, or will ComfyUI's work?
+            x = new_latents * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+            #x = latents
+            #x = latents + noise * sigma #torch.sqrt(1.0 + sigma ** 2.0)
+            # replace latents in args with x
+            args[-1] = x
+            e_t_theta = sample_func(model, zero_noise, *args, **kwargs) * (model.model.latent_format.scale_factor)
+            x_0_t = (x - sqrt_one_minus_alpha_prod * e_t_theta) / sqrt_alpha_prod
+            freq_delta = (self.get_low_or_high_fft(x_0_t, self.scale, is_low=False) - self.get_low_or_high_fft(new_latents, self.scale, is_low=False))
+            noise = e_t_theta + sqrt_alpha_prod / sqrt_one_minus_alpha_prod * freq_delta
+        #return latents, noise
+        #x = latents * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+        #return zero_noise, x #noise * (model.model.latent_format.scale_factor)
+        return latents, noise# * (model.model.latent_format.scale_factor)
+
+    def _perform_calibration_not_custom(self, sample_func: Callable, model: ModelPatcher, latents: Tensor, noise: Tensor, args: list, kwargs: dict):
+        return latents, noise
+    
+    @staticmethod
+    # From NoiseCalibration code at https://github.com/yangqy1110/NC-SDEdit/
+    def get_low_or_high_fft(x: Tensor, scale: float, is_low=True):
+        # reshape to match intended dims; starts in b c h w, turn into c b h w
+        x = rearrange(x, "b c h w -> c b h w")
+        # FFT
+        x_freq = fft.fftn(x, dim=(-2, -1))
+        x_freq = fft.fftshift(x_freq, dim=(-2, -1))
+        C, T, H, W = x_freq.shape
+        
+        # extract
+        if is_low:
+            mask = torch.zeros((C, T, H, W), device=x.device)
+            crow, ccol = H // 2, W // 2
+            mask[..., crow - int(crow * scale):crow + int(crow * scale), ccol - int(ccol * scale):ccol + int(ccol * scale)] = 1
+        else:
+            mask = torch.ones((C, T, H, W), device=x.device)
+            crow, ccol = H // 2, W //2
+            mask[..., crow - int(crow * scale):crow + int(crow * scale), ccol - int(ccol * scale):ccol + int(ccol * scale)] = 0
+        x_freq = x_freq * mask
+        
+        # IFFT
+        x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
+        x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
+        # rearrange back to ComfyUI expected dims
+        x_filtered = rearrange(x_filtered, "c b h w -> b c h w")
+        return x_filtered
 
 
 class CFGExtras:
@@ -533,6 +720,12 @@ class CustomCFGKeyframe:
         self.start_t = 999999999.9
         self.guarantee_steps = guarantee_steps
     
+    def get_effective_guarantee_steps(self, max_sigma: torch.Tensor):
+        '''If keyframe starts before current sampling range (max_sigma), treat as 0.'''
+        if torch.allclose(self.start_t, max_sigma) or self.start_t < max_sigma:
+            return self.guarantee_steps
+        return 0
+
     def clone(self):
         c = CustomCFGKeyframe(cfg_multival=self.cfg_multival,
                               start_percent=self.start_percent, guarantee_steps=self.guarantee_steps)
@@ -581,16 +774,21 @@ class CustomCFGKeyframeGroup:
     
     def initialize_timesteps(self, model: BaseModel):
         for keyframe in self.keyframes:
-            keyframe.start_t = model.model_sampling.percent_to_sigma(keyframe.start_percent)
+            to_assign = torch.tensor(model.model_sampling.percent_to_sigma(keyframe.start_percent), device=model.model_sampling.sigma_max.device)
+            if keyframe.start_percent == 0.0 and to_assign > model.model_sampling.sigma_max:
+                keyframe.start_t = model.model_sampling.sigma_max
+            else:
+                keyframe.start_t = to_assign
     
-    def prepare_current_keyframe(self, t: Tensor):
+    def prepare_current_keyframe(self, t: Tensor, transformer_options: dict[str, Tensor]):
         curr_t: float = t[0]
         # if curr_t same as before, do nothing as step already accounted for
         if curr_t == self._previous_t:
             return
         prev_index = self._current_index
+        max_sigma = torch.max(transformer_options.get("sample_sigmas", BIGMAX_TENSOR))
         # if met guaranteed steps, look for next keyframe in case need to switch
-        if self._current_used_steps >= self._current_keyframe.guarantee_steps:
+        if self._current_used_steps >= self._current_keyframe.get_effective_guarantee_steps(max_sigma):
             # if has next index, loop through and see if need t oswitch
             if self.has_index(self._current_index+1):
                 for i in range(self._current_index+1, len(self.keyframes)):
@@ -602,7 +800,7 @@ class CustomCFGKeyframeGroup:
                         self._current_keyframe = eval_c
                         self._current_used_steps = 0
                         # if guarantee_steps greater than zero, stop searching for other keyframes
-                        if self._current_keyframe.guarantee_steps > 0:
+                        if self._current_keyframe.get_effective_guarantee_steps(max_sigma) > 0:
                             break
                     # if eval_c is outside the percent range, stop looking further
                     else: break

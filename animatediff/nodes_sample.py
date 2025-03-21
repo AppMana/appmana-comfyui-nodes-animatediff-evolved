@@ -5,9 +5,9 @@ from collections.abc import Iterable
 from comfy.sd import VAE
 
 from .freeinit import FreeInitFilter
-from .sample_settings import (FreeInitOptions, IterationOptions,
-                              NoiseLayerAdd, NoiseLayerAddWeighted, NoiseLayerGroup, NoiseLayerReplace, NoiseLayerType,
-                              SeedNoiseGeneration, SampleSettings,
+from .sample_settings import (FreeInitOptions, IterationOptions, AncestralOptions,
+                              NoiseLayerAdd, NoiseLayerAddWeighted, NoiseLayerNormalizedSum, NoiseLayerGroup, NoiseLayerReplace, NoiseLayerType,
+                              SeedNoiseGeneration, SampleSettings, NoiseCalibration, NoiseDeterminism,
                               CustomCFGKeyframeGroup, CustomCFGKeyframe, CFGExtrasGroup, CFGExtras,
                               NoisedImageToInjectGroup, NoisedImageToInject, NoisedImageInjectOptions)
 from .utils_model import BIGMIN, BIGMAX, MAX_RESOLUTION, SigmaSchedule, InterpolationMethod
@@ -28,12 +28,16 @@ class SampleSettingsNode:
             "optional": {
                 "noise_layers": ("NOISE_LAYERS",),
                 "iteration_opts": ("ITERATION_OPTS",),
-                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "forceInput": True}),
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
                 "adapt_denoise_steps": ("BOOLEAN", {"default": False},),
                 "custom_cfg": ("CUSTOM_CFG",),
                 "sigma_schedule": ("SIGMA_SCHEDULE",),
                 "image_inject": ("IMAGE_INJECT",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 10}),
+                "ancestral_opts": ("ANCESTRAL_OPTS",),
+                #"noise_calib": ("NOISE_CALIBRATION",), # TODO: bring back once NoiseCalibration is working
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -44,11 +48,42 @@ class SampleSettingsNode:
 
     def create_settings(self, batch_offset: int, noise_type: str, seed_gen: str, seed_offset: int, noise_layers: NoiseLayerGroup=None,
                         iteration_opts: IterationOptions=None, seed_override: int=None, adapt_denoise_steps=False,
-                        custom_cfg: CustomCFGKeyframeGroup=None, sigma_schedule: SigmaSchedule=None, image_inject: NoisedImageToInjectGroup=None):
+                        custom_cfg: CustomCFGKeyframeGroup=None, sigma_schedule: SigmaSchedule=None, image_inject: NoisedImageToInjectGroup=None,
+                        noise_calib: NoiseCalibration=None, ancestral_opts=None):
         sampling_settings = SampleSettings(batch_offset=batch_offset, noise_type=noise_type, seed_gen=seed_gen, seed_offset=seed_offset, noise_layers=noise_layers,
                                            iteration_opts=iteration_opts, seed_override=seed_override, adapt_denoise_steps=adapt_denoise_steps,
-                                           custom_cfg=custom_cfg, sigma_schedule=sigma_schedule, image_injection=image_inject)
+                                           custom_cfg=custom_cfg, sigma_schedule=sigma_schedule, image_injection=image_inject, noise_calibration=noise_calib,
+                                           ancestral_opts=ancestral_opts)
         return (sampling_settings,)
+
+
+class AncestralOptionsNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                #"batch_offset": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
+                "noise_type": (NoiseLayerType.LIST_ANCESTRAL,),
+                #"determinism": (NoiseDeterminism._LIST,),
+                "seed_offset": ("INT", {"default": 0, "min": BIGMIN, "max": BIGMAX}),
+                #"seed_gen_override": (SeedNoiseGeneration.LIST_WITH_OVERRIDE,),
+            },
+            "optional": {
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
+            }
+        }
+
+    RETURN_TYPES = ("ANCESTRAL_OPTS",)
+    CATEGORY = "Animate Diff 🎭🅐🅓/sample settings"
+    FUNCTION = "create_ancestral_opts"
+
+    def create_ancestral_opts(self, noise_type: str, seed_offset: int, determinism: str=NoiseDeterminism.DEFAULT, seed_override: int=None):
+        if isinstance(seed_override, Iterable):
+            raise Exception("Passing in a list of seeds for Ancestral Options is not supported at this time.")
+        return (AncestralOptions(noise_type=noise_type, determinism=determinism, seed_offset=seed_offset, seed_override=seed_override),)
 
 
 class NoiseLayerReplaceNode:
@@ -64,8 +99,10 @@ class NoiseLayerReplaceNode:
             "optional": {
                 "prev_noise_layers": ("NOISE_LAYERS",),
                 "mask_optional": ("MASK",),
-                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "forceInput": True}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 20}),
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -100,8 +137,10 @@ class NoiseLayerAddNode:
             "optional": {
                 "prev_noise_layers": ("NOISE_LAYERS",),
                 "mask_optional": ("MASK",),
-                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "forceInput": True}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 20}),
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -139,8 +178,10 @@ class NoiseLayerAddWeightedNode:
             "optional": {
                 "prev_noise_layers": ("NOISE_LAYERS",),
                 "mask_optional": ("MASK",),
-                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "forceInput": True}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 10}),
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -159,6 +200,46 @@ class NoiseLayerAddWeightedNode:
         layer = NoiseLayerAddWeighted(noise_type=noise_type, batch_offset=batch_offset, seed_gen_override=seed_gen_override, seed_offset=seed_offset,
                               seed_override=seed_override, mask=mask_optional,
                               noise_weight=noise_weight, balance_multiplier=balance_multiplier)
+        prev_noise_layers.add_to_start(layer)
+        return (prev_noise_layers,)
+
+
+class NoiseLayerNormalizedSumNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "batch_offset": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
+                "noise_type": (NoiseLayerType.LIST,),
+                "seed_gen_override": (SeedNoiseGeneration.LIST_WITH_OVERRIDE,),
+                "seed_offset": ("INT", {"default": 0, "min": BIGMIN, "max": BIGMAX}),
+                "noise_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "optional": {
+                "prev_noise_layers": ("NOISE_LAYERS",),
+                "mask_optional": ("MASK",),
+                "seed_override": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "defaultInput": True}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
+            }
+        }
+
+    RETURN_TYPES = ("NOISE_LAYERS",)
+    CATEGORY = "Animate Diff 🎭🅐🅓/noise layers"
+    FUNCTION = "create_layers"
+
+    def create_layers(self, batch_offset: int, noise_type: str, seed_gen_override: str, seed_offset: int,
+                      noise_weight: float,
+                      prev_noise_layers: NoiseLayerGroup=None, mask_optional: Tensor=None, seed_override: int=None,):
+        # prepare prev_noise_layers
+        if prev_noise_layers is None:
+            prev_noise_layers = NoiseLayerGroup()
+        prev_noise_layers = prev_noise_layers.clone()
+        # create layer
+        layer = NoiseLayerNormalizedSum(noise_type=noise_type, batch_offset=batch_offset, seed_gen_override=seed_gen_override, seed_offset=seed_offset,
+                              seed_override=seed_override, mask=mask_optional,
+                              noise_weight=noise_weight)
         prev_noise_layers.add_to_start(layer)
         return (prev_noise_layers,)
 
@@ -202,7 +283,9 @@ class FreeInitOptionsNode:
             "optional": {
                 "iter_batch_offset": ("INT", {"default": 0, "min": 0, "max": BIGMAX}),
                 "iter_seed_offset": ("INT", {"default": 1, "min": BIGMIN, "max": BIGMAX}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 55}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -220,6 +303,29 @@ class FreeInitOptionsNode:
         return (iter_opts,)
 
 
+class NoiseCalibrationNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "calib_iterations": ("INT", {"default": 1, "min": 1, "step": 1}),
+                "thresh_freq": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
+            }
+        }
+    
+    RETURN_TYPES = ("NOISE_CALIBRATION",)
+    RETURN_NAMES = ("NOISE_CALIB",)
+    CATEGORY = "Animate Diff 🎭🅐🅓/sample settings"
+    FUNCTION = "create_noisecalibration"
+
+    def create_noisecalibration(self, calib_iterations: int, thresh_freq: float):
+        noise_calib = NoiseCalibration(scale=thresh_freq, calib_iterations=calib_iterations)
+        return (noise_calib,)
+
+
 class CustomCFGNode:
     @classmethod
     def INPUT_TYPES(s):
@@ -229,7 +335,9 @@ class CustomCFGNode:
             },
             "optional": {
                 "cfg_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 20}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -253,7 +361,9 @@ class CustomCFGSimpleNode:
             },
             "optional": {
                 "cfg_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 10}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
     
@@ -277,7 +387,9 @@ class CustomCFGKeyframeNode:
             "optional": {
                 "prev_custom_cfg": ("CUSTOM_CFG",),
                 "cfg_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 80}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -307,6 +419,8 @@ class CustomCFGKeyframeSimpleNode:
             "optional": {
                 "prev_custom_cfg": ("CUSTOM_CFG",),
                 "cfg_extras": ("CFG_EXTRAS",),
+            },
+            "hidden": {
                 "autosize": ("ADEAUTOSIZE", {"padding": 10}),
             }
         }
@@ -337,7 +451,9 @@ class CustomCFGKeyframeInterpolationNode:
             "optional": {
                 "prev_custom_cfg": ("CUSTOM_CFG",),
                 "cfg_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 70}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
     
@@ -424,7 +540,9 @@ class CFGExtrasPAGNode:
             },
             "optional": {
                 "prev_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 45}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
@@ -456,6 +574,8 @@ class CFGExtrasPAGSimpleNode:
             },
             "optional": {
                 "prev_extras": ("CFG_EXTRAS",),
+            },
+            "hidden": {
                 "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
@@ -509,7 +629,9 @@ class CFGExtrasRescaleCFGSimpleNode:
             },
             "optional": {
                 "prev_extras": ("CFG_EXTRAS",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 45}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 10}),
             }
         }
 
@@ -539,6 +661,8 @@ class NoisedImageInjectionNode:
                 "img_inject_opts": ("IMAGE_INJECT_OPTIONS", ),
                 "strength_multival": ("MULTIVAL", ),
                 "prev_image_inject": ("IMAGE_INJECT", ),
+            },
+            "hidden": {
                 "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
@@ -569,7 +693,9 @@ class NoisedImageInjectOptionsNode:
             "optional": {
                 "composite_x": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
                 "composite_y": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 30}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
     

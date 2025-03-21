@@ -1,10 +1,11 @@
 [project]
 name = "comfyui-animatediff-evolved"
 description = "Improved AnimateDiff integration for ComfyUI."
-version = "1.2.3"
+version = "1.4.4"
 license = { file = "LICENSE" }
 dependencies = [
-    "comfyui>=0.2.3"
+    "comfyui>=0.2.3",
+    "comfyui-frontend-package@git+https://github.com/AppMana/appmana-comfyui-frontend.git#796787ffb4603e182415dbc9632160741fa29f94&subdirectory=comfyui_frontend_package",
 ]
 
 [project.urls]
