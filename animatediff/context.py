@@ -12,6 +12,7 @@ from comfy.model_base import BaseModel
 from comfy.model_patcher import ModelPatcher
 
 from .context_extras import ContextExtrasGroup
+from .utils_model import BIGMAX_TENSOR
 from .utils_motion import get_sorted_list_via_attr
 
 
@@ -19,15 +20,23 @@ class ContextFuseMethod:
     FLAT = "flat"
     PYRAMID = "pyramid"
     RELATIVE = "relative"
-    RANDOM = "random"
-    GAUSS_SIGMA = "gauss-sigma"
-    GAUSS_SIGMA_INV = "gauss-sigma inverse"
-    DELAYED_REVERSE_SAWTOOTH = "delayed reverse sawtooth"
-    PYRAMID_SIGMA = "pyramid-sigma"
-    PYRAMID_SIGMA_INV = "pyramid-sigma inverse"
+    OVERLAP_LINEAR = "overlap-linear"
 
-    LIST = [PYRAMID, FLAT, DELAYED_REVERSE_SAWTOOTH, PYRAMID_SIGMA, PYRAMID_SIGMA_INV, GAUSS_SIGMA, GAUSS_SIGMA_INV, RANDOM]
-    LIST_STATIC = [PYRAMID, RELATIVE, FLAT, DELAYED_REVERSE_SAWTOOTH, PYRAMID_SIGMA, PYRAMID_SIGMA_INV, GAUSS_SIGMA, GAUSS_SIGMA_INV, RANDOM]
+    RANDOM = "🔬random"
+    RANDOM_DEPR = "random"
+    GAUSS_SIGMA = "🔬gauss-sigma"
+    GAUSS_SIGMA_DEPR = "gauss-sigma"
+    GAUSS_SIGMA_INV = "🔬gauss-sigma inverse"
+    GAUSS_SIGMA_INV_DEPR = "gauss-sigma inverse"
+    DELAYED_REVERSE_SAWTOOTH = "🔬delayed reverse sawtooth"
+    DELAYED_REVERSE_SAWTOOTH_DEPR = "delayed reverse sawtooth"
+    PYRAMID_SIGMA = "🔬pyramid-sigma"
+    PYRAMID_SIGMA_DEPR = "pyramid-sigma"
+    PYRAMID_SIGMA_INV = "🔬pyramid-sigma inverse"
+    PYRAMID_SIGMA_INV_DEPR = "pyramid-sigma inverse"
+
+    LIST = [PYRAMID, FLAT, OVERLAP_LINEAR, DELAYED_REVERSE_SAWTOOTH, PYRAMID_SIGMA, PYRAMID_SIGMA_INV, GAUSS_SIGMA, GAUSS_SIGMA_INV, RANDOM]
+    LIST_STATIC = [PYRAMID, RELATIVE, FLAT, OVERLAP_LINEAR, DELAYED_REVERSE_SAWTOOTH, PYRAMID_SIGMA, PYRAMID_SIGMA_INV, GAUSS_SIGMA, GAUSS_SIGMA_INV, RANDOM]
 
 
 class ContextType:
@@ -64,6 +73,12 @@ class ContextOptions:
         self._step = value
         if self.view_options:
             self.view_options.step = value
+
+    def get_effective_guarantee_steps(self, max_sigma: torch.Tensor):
+        '''If keyframe starts before current sampling range (max_sigma), treat as 0.'''
+        if self.start_t > max_sigma:
+            return 0
+        return self.guarantee_steps
 
     def clone(self):
         n = ContextOptions(context_length=self.context_length, context_stride=self.context_stride,
@@ -141,18 +156,19 @@ class ContextOptionsGroup:
             context.start_t = model.model_sampling.percent_to_sigma(context.start_percent)
         self.extras.initialize_timesteps(model)
 
-    def prepare_current(self, t: Tensor):
-        self.prepare_current_context(t)
-        self.extras.prepare_current(t)
+    def prepare_current(self, t: Tensor, transformer_options):
+        self.prepare_current_context(t, transformer_options)
+        self.extras.prepare_current(t, transformer_options)
 
-    def prepare_current_context(self, t: Tensor):
+    def prepare_current_context(self, t: Tensor, transformer_options: dict[str, Tensor]):
         curr_t: float = t[0]
         # if same as previous, do nothing as step already accounted for
         if curr_t == self._previous_t:
             return
         prev_index = self._current_index
+        max_sigma = torch.max(transformer_options.get("sample_sigmas", BIGMAX_TENSOR))
         # if met guaranteed steps, look for next context in case need to switch
-        if self._current_used_steps >= self._current_context.guarantee_steps:
+        if self._current_used_steps >= self._current_context.get_effective_guarantee_steps(max_sigma):
             # if has next index, loop through and see if need to switch
             if self.has_index(self._current_index+1):
                 for i in range(self._current_index+1, len(self.contexts)):
@@ -164,7 +180,7 @@ class ContextOptionsGroup:
                         self._current_context = eval_c
                         self._current_used_steps = 0
                         # if guarantee_steps greater than zero, stop searching for other keyframes
-                        if self._current_context.guarantee_steps > 0:
+                        if self._current_context.get_effective_guarantee_steps(max_sigma) > 0:
                             break
                     # if eval_c is outside the percent range, stop looking further
                     else:
@@ -329,7 +345,7 @@ def create_windows_default(num_frames: int, opts: Union[ContextOptionsGroup, Con
     return [list(range(num_frames))]
 
 
-def get_context_windows(num_frames: int, opts: Union[ContextOptionsGroup, ContextOptions]):
+def get_context_windows(num_frames: int, opts: Union[ContextOptionsGroup, ContextOptions]) -> list[list[int]]:
     context_func = CONTEXT_MAPPING.get(opts.context_schedule, None)
     if not context_func:
         raise ValueError(f"Unknown context_schedule '{opts.context_schedule}'.")
@@ -346,11 +362,11 @@ CONTEXT_MAPPING = {
 }
 
 
-def get_context_weights(num_frames: int, fuse_method: str, sigma: Tensor = None):
-    weights_func = FUSE_MAPPING.get(fuse_method, None)
+def get_context_weights(length: int, full_length: int, idxs: list[int], ctx_opts: ContextOptions, sigma: Tensor=None):
+    weights_func = FUSE_MAPPING.get(ctx_opts.fuse_method, None)
     if not weights_func:
-        raise ValueError(f"Unknown fuse_method '{fuse_method}'.")
-    return weights_func(num_frames, sigma=sigma )
+        raise ValueError(f"Unknown fuse_method '{ctx_opts.fuse_method}'.")
+    return weights_func(length, sigma=sigma, ctx_opts=ctx_opts, full_length=full_length, idxs=idxs)
 
 
 def create_weights_flat(length: int, **kwargs) -> list[float]:
@@ -367,6 +383,20 @@ def create_weights_pyramid(length: int, **kwargs) -> list[float]:
         max_weight = (length + 1) // 2
         weight_sequence = list(range(1, max_weight, 1)) + [max_weight] + list(range(max_weight - 1, 0, -1))
     return weight_sequence
+
+def create_weights_overlap_linear(length: int, full_length: int, idxs: list[int], ctx_opts: ContextOptions, **kwargs):
+    # based on code in Kijai's WanVideoWrapper: https://github.com/kijai/ComfyUI-WanVideoWrapper/blob/dbb2523b37e4ccdf45127e5ae33e31362f755c8e/nodes.py#L1302
+    # only expected overlap is given different weights
+    weights_torch = torch.ones((length))
+    # blend left-side on all except first window
+    if min(idxs) > 0:
+        ramp_up = torch.linspace(1e-37, 1, ctx_opts.context_overlap)
+        weights_torch[:ctx_opts.context_overlap] = ramp_up
+    # blend right-side on all except last window
+    if max(idxs) < full_length-1:
+        ramp_down = torch.linspace(1, 1e-37, ctx_opts.context_overlap)
+        weights_torch[-ctx_opts.context_overlap:] = ramp_down
+    return weights_torch
 
 def create_weights_random(length: int, **kwargs) -> list[float]:
     if length % 2 == 0:
@@ -446,12 +476,20 @@ FUSE_MAPPING = {
     ContextFuseMethod.FLAT: create_weights_flat,
     ContextFuseMethod.PYRAMID: create_weights_pyramid,
     ContextFuseMethod.RELATIVE: create_weights_pyramid,
+    ContextFuseMethod.OVERLAP_LINEAR: create_weights_overlap_linear,
+    # experimental
     ContextFuseMethod.GAUSS_SIGMA: create_weights_gauss_sigma,
+    ContextFuseMethod.GAUSS_SIGMA_DEPR: create_weights_gauss_sigma,
     ContextFuseMethod.GAUSS_SIGMA_INV: create_weights_gauss_sigma_inv,
+    ContextFuseMethod.GAUSS_SIGMA_INV_DEPR: create_weights_gauss_sigma_inv,
     ContextFuseMethod.RANDOM: create_weights_random,
+    ContextFuseMethod.RANDOM_DEPR: create_weights_random,
     ContextFuseMethod.DELAYED_REVERSE_SAWTOOTH: create_weights_delayed_reverse_sawtooth,
+    ContextFuseMethod.DELAYED_REVERSE_SAWTOOTH_DEPR: create_weights_delayed_reverse_sawtooth,
     ContextFuseMethod.PYRAMID_SIGMA: create_weights_pyramid_sigma,
+    ContextFuseMethod.PYRAMID_SIGMA_DEPR: create_weights_pyramid_sigma,
     ContextFuseMethod.PYRAMID_SIGMA_INV: create_weights_pyramid_sigma_inv,
+    ContextFuseMethod.PYRAMID_SIGMA_INV_DEPR: create_weights_pyramid_sigma_inv,
 }
 
 
@@ -604,9 +642,14 @@ def draw_view(window: list[int], gd: GridDisplay):
     draw_subidxs(window=window, gd=gd, y_grid_offset=2, color=gd.vs.view_color)
 
 
-def generate_context_visualization(context_opts: ContextOptionsGroup, model: ModelPatcher, sampler_name: str=None, scheduler: str=None,
+def generate_context_visualization(model: ModelPatcher, context_opts: ContextOptionsGroup=None, sampler_name: str=None, scheduler: str=None,
                                    width=1440, height=200, video_length=32,
                                    steps=None, start_step=None, end_step=None, sigmas=None, force_full_denoise=False, denoise=None):
+    if context_opts is None:
+        context_opts = ContextOptionsGroup.default()
+        params = model.get_attachment("ADE_params")
+        if params is not None:
+            context_opts = params.context_options
     context_opts = context_opts.clone()
     vs = VisualizeSettings(width, video_length)
     all_imgs = []
@@ -637,12 +680,14 @@ def generate_context_visualization(context_opts: ContextOptionsGroup, model: Mod
 
     for i, t in enumerate(sigmas):
         # make context_opts reflect current step/sigma
-        context_opts.prepare_current([t])
+        context_opts.prepare_current([t], {})
         context_opts.step = start_step+i
 
         # check if context should even be active in this case
         context_active = True
-        if video_length < context_opts.context_length:
+        if context_opts.context_length is None:
+            context_active = False
+        elif video_length < context_opts.context_length:
             context_active = False
         elif video_length == context_opts.context_length and not context_opts.use_on_equal_length:
             context_active = False

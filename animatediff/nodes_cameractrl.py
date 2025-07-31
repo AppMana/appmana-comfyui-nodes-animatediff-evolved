@@ -16,7 +16,7 @@ from .logger import logger
 from .utils_model import get_available_motion_models, calculate_file_hash, strip_path, BIGMAX
 from .utils_motion import ADKeyframeGroup
 from .motion_lora import MotionLoraList
-from .model_injection import (MotionModelGroup, MotionModelPatcher, load_motion_module_gen2, inject_camera_encoder_into_model)
+from .model_injection import (MotionModelGroup, MotionModelPatcher, get_mm_attachment, load_motion_module_gen2, inject_camera_encoder_into_model)
 from .nodes_gen2 import ApplyAnimateDiffModelNode, ADKeyframeNode
 
 
@@ -115,13 +115,13 @@ def compute_R_from_rad_angle(angles: np.ndarray):
     R = np.dot(Rz, np.dot(Ry, Rx))
     return R
 
-def get_camera_motion(angle: np.ndarray, T: np.ndarray, speed: float, n=16):
+def get_camera_motion(angle: np.ndarray, T: np.ndarray, speed: float, n=16, base=16):
     RT = []
     for i in range(n):
-        _angle = (i/n)*speed*(CAM.BASE_ANGLE)*angle
+        _angle = (i/base)*speed*(CAM.BASE_ANGLE)*angle
         R = compute_R_from_rad_angle(_angle) 
         # _T = (i/n)*speed*(T.reshape(3,1))
-        _T=(i/n)*speed*(CAM.BASE_T_NORM)*(T.reshape(3,1))
+        _T=(i/base)*speed*(CAM.BASE_T_NORM)*(T.reshape(3,1))
         _RT = np.concatenate([R,_T], axis=1)
         RT.append(_RT)
     RT = np.stack(RT)
@@ -143,6 +143,22 @@ def combine_RTs(RT_0: np.ndarray, RT_1: np.ndarray):
 
     return np.concatenate([RT_0, RT_1], axis=0)
 
+def stack_RTs(RT_0: np.ndarray, RT_1: np.ndarray):
+    RT_target = copy.deepcopy(RT_1)
+    static_motion = CAM.get(CAM.STATIC)
+    RT_static = get_camera_motion(static_motion.rotate, static_motion.translate, 1.0, 1)
+    RT_offset = RT_0[-1] - RT_static[-1]
+
+    temp = []
+    for sub_RT in RT_target:
+        temp.append(sub_RT + RT_offset)
+
+    RT_1 = np.stack(temp)
+    RT_0 = RT_0[:-1]
+
+    return np.concatenate([RT_0, RT_1], axis=0)
+
+
 def set_original_pose_dims(poses: list[list[float]], pose_width, pose_height):
     # indexes 5 and 6 are not used for anything in the poses, so can use 5 and 6 to set original pose width/height
     new_poses = copy.deepcopy(poses)
@@ -157,7 +173,17 @@ def combine_poses(poses0: list[list[float]], poses1: list[list[float]]):
     inter_poses = ndarray_to_poses(new_RT)
     # maintain fx, fy, cx, and cy values by pasting only the movement portion of poses
     for i in range(len(new_poses)):
-        new_poses[7:] = inter_poses[7:]
+        new_poses[i][7:] = inter_poses[i][7:]
+    return new_poses
+
+
+def combine_poses_redux(poses0: list[list[float]], poses1: list[list[float]]):
+    new_poses = copy.deepcopy(poses0[:-1]) + copy.deepcopy(poses1)
+    new_RT = stack_RTs(poses_to_ndarray(poses0), poses_to_ndarray(poses1))
+    inter_poses = ndarray_to_poses(new_RT)
+    # maintain fx, fy, cx, and cy values by pasting only the movement portion of poses
+    for i in range(len(new_poses)):
+        new_poses[i][7:] = inter_poses[i][7:]
     return new_poses
 
 
@@ -230,8 +256,9 @@ class ApplyAnimateDiffWithCameraCtrl:
         if curr_model.model.camera_encoder is None:
             raise Exception(f"Motion model '{curr_model.model.mm_info.mm_name}' does not contain a camera_encoder; cannot be used with Apply AnimateDiff-CameraCtrl Model node.")
         camera_entries = [CameraEntry(entry) for entry in cameractrl_poses]
-        curr_model.orig_camera_entries = camera_entries
-        curr_model.cameractrl_multival = cameractrl_multival
+        attachment = get_mm_attachment(curr_model)
+        attachment.orig_camera_entries = camera_entries
+        attachment.cameractrl_multival = cameractrl_multival
         return new_m_models
 
 
@@ -273,7 +300,9 @@ class CameraCtrlADKeyframeNode:
                 "cameractrl_multival": ("MULTIVAL",),
                 "inherit_missing": ("BOOLEAN", {"default": True}, ),
                 "guarantee_steps": ("INT", {"default": 1, "min": 0, "max": BIGMAX}),
-                "autosize": ("ADEAUTOSIZE", {"padding": 30}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
     
@@ -373,7 +402,9 @@ class CameraCtrlPoseBasic:
             },
             "optional": {
                 "prev_poses": ("CAMERACTRL_POSES",),
-                "autosize": ("ADEAUTOSIZE", {"padding": 30}),
+            },
+            "hidden": {
+                "autosize": ("ADEAUTOSIZE", {"padding": 0}),
             }
         }
 
