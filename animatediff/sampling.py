@@ -320,7 +320,7 @@ class FunctionInjectionHolder:
     def __init__(self):
         self.temp_uninjector: GroupnormUninjectHelper = GroupnormUninjectHelper()
         self.groupnorm_injector: GroupnormInjectHelper = GroupnormInjectHelper()
-    
+
     def inject_functions(self, helper: ModelPatcherHelper, params: InjectionParams, model_options: dict):
         # Save Original Functions - order must match between here and restore_functions
         self.orig_memory_required = None
@@ -336,8 +336,8 @@ class FunctionInjectionHolder:
             # only apply groupnorm hack if PIA, v2 and not properly applied, or v1
             info: AnimateDiffInfo = helper.get_motion_models()[0].model.mm_info
             if ((info.mm_format == AnimateDiffFormat.PIA) or
-                (info.mm_version == AnimateDiffVersion.V2 and not params.apply_v2_properly) or
-                (info.mm_version == AnimateDiffVersion.V1)):
+                    (info.mm_version == AnimateDiffVersion.V2 and not params.apply_v2_properly) or
+                    (info.mm_version == AnimateDiffVersion.V1)):
                 self.inject_groupnorm_forward = groupnorm_mm_factory(params)
                 self.inject_groupnorm_forward_comfy_cast_weights = groupnorm_mm_factory(params, manual_cast=True)
                 self.groupnorm_injector = GroupnormInjectHelper(self)
@@ -377,7 +377,7 @@ class GroupnormUninjectHelper:
         self.holder = holder
         self.previous_gn_forward = None
         self.previous_dwi_gn_cast_weights = None
-    
+
     def __enter__(self):
         if self.holder is None:
             return self
@@ -404,7 +404,7 @@ class GroupnormInjectHelper:
         self.holder = holder
         self.previous_gn_forward = None
         self.previous_dwi_gn_cast_weights = None
-    
+
     def __enter__(self):
         if self.holder is None:
             return self
@@ -423,7 +423,7 @@ class GroupnormInjectHelper:
         torch.nn.GroupNorm.forward = self.previous_gn_forward
         comfy.ops.disable_weight_init.GroupNorm.forward_comfy_cast_weights = self.previous_dwi_gn_cast_weights
         self.previous_gn_forward = None
-        self.previous_dwi_gn_cast_weights = None     
+        self.previous_dwi_gn_cast_weights = None
 
 
 def outer_sample_wrapper(executor: WrapperExecutor, *args, **kwargs):
@@ -436,7 +436,7 @@ def outer_sample_wrapper(executor: WrapperExecutor, *args, **kwargs):
 
     try:
         guider: comfy.samplers.CFGGuider = executor.class_obj
-helper = ModelPatcherHelper(guider.model_patcher)
+        helper = ModelPatcherHelper(guider.model_patcher)
 
         orig_model_options = guider.model_options
         guider.model_options = comfy.model_patcher.create_model_options_clone(guider.model_options)
@@ -549,8 +549,8 @@ helper = ModelPatcherHelper(guider.model_patcher)
                                                           sample_settings=helper.get_sample_settings(), noise_extra_args=noise_extra_args,
                                                           **iter_kwargs)
             if helper.get_sample_settings().noise_calibration is not None:
-                    latents, noise = helper.get_sample_settings().noise_calibration.perform_calibration(sample_func=executor, model=helper.model, latents=latents, noise=noise,
-                                                                                                 is_custom=True, args=args, kwargs=kwargs)
+                latents, noise = helper.get_sample_settings().noise_calibration.perform_calibration(sample_func=executor, model=helper.model, latents=latents, noise=noise,
+                                                                                                    is_custom=True, args=args, kwargs=kwargs)
             # finalize latent_image in args
             args[0] = noise
             args[1] = latents
@@ -652,7 +652,7 @@ def perform_image_injection(ADGS: AnimateDiffGlobalState, model: BaseModel, late
             return latents
         # x0 should be process_latent_out'ed to match expected state of latents between nodes
         x0 = model.process_latent_out(x0)
-    
+
         # first, decode x0 into images, and then re-encode
         decoded_images = vae_decode_raw_batched(to_inject.vae, x0)
         encoded_x0 = vae_encode_raw_batched(to_inject.vae, decoded_images)
@@ -676,7 +676,7 @@ def perform_image_injection(ADGS: AnimateDiffGlobalState, model: BaseModel, late
                                       multiplier=to_inject.vae.downscale_ratio, resize_source=to_inject.resize_image).movedim(1, -1)
         # encode composited to get latent representation
         composited = vae_encode_raw_batched(to_inject.vae, composited)
-        # add encoded_x0 diff to composited 
+        # add encoded_x0 diff to composited
         composited += encoded_x0
         if type(to_inject.strength_multival) == float and math.isclose(1.0, to_inject.strength_multival):
             return composited.to(dtype=orig_dtype, device=orig_device)
@@ -763,7 +763,7 @@ def sliding_calc_cond_batch(executor: Callable, model, conds: list[list[dict]], 
 
     if ADGS.motion_models is not None:
         ADGS.motion_models.set_view_options(ADGS.params.context_options.view_options)
-    
+
     # prepare final conds, out_counts, and biases
     conds_final = [torch.zeros_like(x_in) for _ in conds]
     if ADGS.params.context_options.fuse_method == ContextFuseMethod.RELATIVE:
@@ -813,7 +813,7 @@ def sliding_calc_cond_batch(executor: Callable, model, conds: list[list[dict]], 
                 comfy.samplers.cast_transformer_options(model_options_batch["transformer_options"], device=device)
                 with torch.no_grad():
                     results.append(evaluate_context_windows(executor, model, x_in, conds, timestep, batch_windows, model_options_batch, CREF, ADGS,
-                                                       device=device, first_device=first_device))
+                                                            device=device, first_device=first_device))
             combined_results: list[list[ContextResults]] = []
             threads: list[threading.Thread] = []
             try:
@@ -834,14 +834,14 @@ def sliding_calc_cond_batch(executor: Callable, model, conds: list[list[dict]], 
             for results in combined_results:
                 for result in results:
                     combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), timestep,
-                                                ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
+                                                   ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
 
         else:
             for enum_window in enumerated_context_windows:
                 results = evaluate_context_windows(executor, model, x_in, conds, timestep, [enum_window], model_options, CREF, ADGS)
                 for result in results:
                     combine_context_window_results(x_in, result.sub_conds_out, result.sub_conds, result.ctx_idxs, result.window_idx, len(enumerated_context_windows), timestep,
-                                                ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
+                                                   ADGS, NAIVE, CREF, conds_final, counts_final, biases_final)
     finally:
         CREF.cleanup(model_options)
 
@@ -864,7 +864,7 @@ ContextResults = collections.namedtuple("ContextResults", ['window_idx', 'sub_co
 def evaluate_context_windows(executor, model: BaseModel, x_in: Tensor, conds, timestep: Tensor, enumerated_context_windows: list[tuple[int, list[int]]],
                              model_options, CREF: ContextRefHandler, ADGS: AnimateDiffGlobalState, device=None, first_device=None):
     results: list[ContextResults] = []
-        for window_idx, ctx_idxs in enumerated_context_windows:
+    for window_idx, ctx_idxs in enumerated_context_windows:
         # allow processing to end between context window executions for faster Cancel
         if device is None:
             # non-MultiGPU execution

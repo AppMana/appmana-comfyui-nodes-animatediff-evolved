@@ -4,7 +4,7 @@ description = "Improved AnimateDiff integration for ComfyUI."
 version = "1.5.5"
 license = { file = "LICENSE" }
 dependencies = [
-    "comfyui>=0.2.3"
+    "comfyui>=0.3.0"
 ]
 
 [project.urls]

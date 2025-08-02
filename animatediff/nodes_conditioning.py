@@ -9,7 +9,7 @@ from comfy.model_patcher import ModelPatcher
 from comfy.sd import CLIP
 import comfy.sd
 from comfy.hooks import HookGroup, HookKeyframeGroup, HookKeyframe
-import comfy_extras.nodes_hooks
+import comfy_extras.nodes.nodes_hooks
 import comfy.hooks
 import comfy.utils
 
@@ -560,7 +560,7 @@ class MaskableLoraLoaderModelOnlyDEPR(MaskableLoraLoaderDEPR):
         return (model_lora, hooks)
 
 
-class MaskableSDModelLoaderDEPR(comfy_extras.nodes_hooks.CreateHookModelAsLora):
+class MaskableSDModelLoaderDEPR(comfy_extras.nodes.nodes_hooks.CreateHookModelAsLora):
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -666,7 +666,7 @@ class SetClipLoraHookDEPR:
     DEPRECATED = True
 
     def apply_lora_hook(self, clip: CLIP, lora_hook: HookGroup):
-        return comfy_extras.nodes_hooks.SetClipHooks.apply_hooks(self, clip, False, lora_hook)
+        return comfy_extras.nodes.nodes_hooks.SetClipHooks.apply_hooks(self, clip, False, lora_hook)
 
 
 class CombineLoraHooksDEPR:

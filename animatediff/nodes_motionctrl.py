@@ -4,7 +4,7 @@ import numpy as np
 import os
 import json
 
-import folder_paths
+from comfy.cmd import folder_paths
 
 from .ad_settings import AnimateDiffSettings
 from .adapter_motionctrl import (ObjectControlModelPatcher, inject_motionctrl_cmcm, load_motionctrl_omcm,
